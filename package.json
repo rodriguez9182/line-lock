@@ -1,0 +1,9 @@
+{
+  "name": "line-lock-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Watches BTC 15-minute Kalshi rounds and sends a push when a play locks",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=22" }
+}
