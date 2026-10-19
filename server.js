@@ -24,6 +24,9 @@
     KELLY_FRACTION  optional. Default 0.25.  KELLY_CAP optional, max fraction of bankroll. Default 0.05
     HEARTBEAT_MIN   optional. Minutes between "still alive" pushes. Default 60. 0 = off
     FEED_ALERTS     optional. Set to 0 to skip feed-down / feed-back pushes
+    PAPER_BANKROLL  optional. Starting balance for the paper-trading tally. Default 1000
+    PAPER_STAKE     optional. 'kelly' (default: KELLY_FRACTION of Kelly, capped at KELLY_CAP) or 'fixed'
+    PAPER_FIXED_STAKE optional. Dollars per paper trade in fixed mode, or when Kelly gives nothing. Default 10
     KALSHI_URL      optional. Link opened from the alert. Default https://kalshi.com/markets/<series>
 */
 const http = require('http');
@@ -49,7 +52,10 @@ const CFG = {
   kellyFrac: num(process.env.KELLY_FRACTION, 0.25),
   kellyCap: num(process.env.KELLY_CAP, 0.05),
   heartbeatMin: num(process.env.HEARTBEAT_MIN, 60),
-  feedAlerts: process.env.FEED_ALERTS !== '0'
+  feedAlerts: process.env.FEED_ALERTS !== '0',
+  paperBank: num(process.env.PAPER_BANKROLL, 1000),
+  paperMode: (process.env.PAPER_STAKE || 'kelly').toLowerCase() === 'fixed' ? 'fixed' : 'kelly',
+  paperFixed: num(process.env.PAPER_FIXED_STAKE, 10)
 };
 CFG.kalshiUrl = process.env.KALSHI_URL || ('https://kalshi.com/markets/' + CFG.series.toLowerCase());
 const ROUND_MS = 900000;
@@ -143,6 +149,48 @@ function stats() {
   out.nCal = nb; out.brier = nb ? bs / nb : null; out.brierMkt = nm ? bm / nm : null;
   out.cal = B.map(b => ({ range: Math.round(b.lo * 100) + '-' + Math.min(100, Math.round(b.hi * 100)) + '%', n: b.n, avgP: b.n ? b.sumP / b.n : null, actual: b.n ? b.hit / b.n : null }));
   return out;
+}
+
+/* ---------- paper trading: replayed from ROUNDS so edits recompute everything ---------- */
+const orderFee = (n, p) => n > 0 && p != null ? Math.ceil(7 * n * p * (1 - p) - 1e-9) / 100 : 0; /* Kalshi taker fee per order */
+function paperSize(bal, prob, ask) {
+  if (ask == null || ask <= 0 || ask >= 1 || bal <= 0) return { n: 0, stake: 0, mode: 'none' };
+  let stake = 0, mode = CFG.paperMode;
+  if (mode === 'kelly') { stake = bal * kelly(prob, ask + kalshiFee(ask)); if (stake <= 0) mode = 'fixed'; }
+  if (mode === 'fixed') stake = Math.min(CFG.paperFixed, bal);
+  let n = Math.floor(stake / (ask + kalshiFee(ask)));
+  if (n < 1 && mode === 'kelly') { mode = 'fixed'; stake = Math.min(CFG.paperFixed, bal); n = Math.floor(stake / (ask + kalshiFee(ask))); }
+  while (n > 0 && n * ask + orderFee(n, ask) > bal) n--;
+  return { n, stake, mode };
+}
+function paper() {
+  let bal = CFG.paperBank, peak = bal, maxDD = 0, maxDDpct = 0, w = 0, l = 0, open = 0, best = null, worst = null, fees = 0;
+  const trades = [];
+  ROUNDS.slice().sort((a, b) => a.end - b.end).forEach(r => {
+    const L = r.locked; if (!L || L.decision !== 'TAKE' || L.ask == null) return;
+    const res = effRes(r); if (res === 'skip') return;
+    const side = effSide(r), z = paperSize(bal, L.prob, L.ask); if (z.n < 1) return;
+    const cost = z.n * L.ask, fee = orderFee(z.n, L.ask);
+    const t = { id: r.id, end: r.end, ticker: r.ticker || null, side, contracts: z.n, ask: L.ask, cost: +cost.toFixed(2), fee, sizing: z.mode, edited: !!r.edit, res: res || 'open', balBefore: +bal.toFixed(2) };
+    if (res !== 'won' && res !== 'lost') { open++; t.pnl = null; trades.push(t); return; } /* pending: not settled yet, cash not deducted */
+    const payout = res === 'won' ? z.n : 0, pnl = payout - cost - fee;
+    bal += pnl; fees += fee; if (res === 'won') w++; else l++;
+    t.payout = payout; t.pnl = +pnl.toFixed(2); t.balAfter = +bal.toFixed(2);
+    if (!best || pnl > best.pnl) best = t; if (!worst || pnl < worst.pnl) worst = t;
+    if (bal > peak) peak = bal; const dd = peak - bal; if (dd > maxDD) { maxDD = dd; maxDDpct = peak > 0 ? dd / peak : 0; }
+    trades.push(t);
+  });
+  const pnl = bal - CFG.paperBank;
+  return { start: CFG.paperBank, mode: CFG.paperMode, fixedStake: CFG.paperFixed, balance: +bal.toFixed(2), pnl: +pnl.toFixed(2), roi: CFG.paperBank ? pnl / CFG.paperBank : null, trades: w + l, open, wins: w, losses: l, winRate: (w + l) ? w / (w + l) : null, fees: +fees.toFixed(2), maxDrawdown: +maxDD.toFixed(2), maxDrawdownPct: maxDDpct, best, worst, recent: trades.slice(-50).reverse() };
+}
+function savePaper() { try { const P = paper(); delete P.recent; fs.writeFileSync(path.join(CFG.dataDir, 'paper.json'), JSON.stringify(P, null, 2)); } catch (e) { console.log('could not save paper.json', e.message); } }
+const paperLine = () => { const P = paper(); return 'Paper ' + usd(P.balance) + ' (' + (P.pnl >= 0 ? '+' : '-') + usd(Math.abs(P.pnl)) + ', ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + ', ' + P.wins + '-' + P.losses + ')'; };
+const CSV_COLS = ['id', 'end_iso', 'ticker', 'line', 'line_from', 'final', 'up', 'source', 'mismatch', 'snap_prob_up', 'snap_raw_up', 'snap_mkt_up', 'snap_verdict', 'snap_edge', 'locked_side', 'decision', 'lock_prob', 'lock_ask', 'lock_fee', 'lock_edge', 'checks_passed', 'checks_total', 'reason', 'edited', 'edit_side', 'edit_res', 'result'];
+function exportCsv() {
+  const q = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const rows = ROUNDS.slice().sort((a, b) => a.end - b.end).map(r => { const L = r.locked || {}, N = r.snap || {}, E = r.edit || {};
+    return [r.id, new Date(r.end).toISOString(), r.ticker, r.line, r.lineFrom, r.fin, r.up, r.source, r.mismatch, N.probUp, N.rawUp, N.mktUp, N.verdict, N.edge, L.side, L.decision, L.prob, L.ask, L.fee, L.edge, L.passN, L.total, L.reason, r.edit ? 1 : 0, E.side, E.res, effRes(r)].map(q).join(','); });
+  return CSV_COLS.join(',') + '\n' + rows.join('\n') + '\n';
 }
 
 /* ---------- indicators ---------- */
@@ -360,12 +408,12 @@ function finalize() {
   const up = d == null || d === 0 ? null : d > 0;
   /* save every round (locked or not) so calibration has data; Kalshi's own result overwrites ours later */
   const rec = { id: R.end, end: R.end, ticker: R.ticker, line: R.line, lineFrom: R.lineFrom, fin, up, source: 'watcher', snap: R.snap, locked: R.locked };
-  ROUNDS = ROUNDS.filter(r => r.id !== rec.id); ROUNDS.push(rec); if (ROUNDS.length > 20000) ROUNDS = ROUNDS.slice(-20000); saveRounds();
+  ROUNDS = ROUNDS.filter(r => r.id !== rec.id); ROUNDS.push(rec); if (ROUNDS.length > 20000) ROUNDS = ROUNDS.slice(-20000); saveRounds(); savePaper();
   if (R.ticker) S.pend.push({ id: rec.id, ticker: R.ticker, tries: 0 });
   if (!R.locked || fin == null) return;
   const res = d === 0 ? 'push' : (((d > 0) === (R.locked.side === 'UP')) ? 'won' : 'lost');
   RECENT.unshift({ end: R.end, side: R.locked.side, reason: R.locked.reason, line: R.line, fin, res }); RECENT = RECENT.slice(0, 30);
-  if (CFG.results) push('Result: ' + R.locked.side + ' ' + res.toUpperCase() + (R.locked.decision === 'TAKE' ? '' : ' (no-edge call)'), 'Round ending ' + etTime(R.end) + ' ET. Line ' + usd(R.line) + ', final ' + usd(fin) + ' (' + (d >= 0 ? '+' : '-') + usd(Math.abs(d)) + '). Watcher estimate; Kalshi settles on the CF Benchmarks index and may differ. Use Edit on the page if it is wrong.', 'low', res === 'won' ? 'white_check_mark' : 'x', pageUrl() ? { click: pageUrl() + '/' } : null);
+  if (CFG.results) push('Result: ' + R.locked.side + ' ' + res.toUpperCase() + (R.locked.decision === 'TAKE' ? '' : ' (no-edge call)'), 'Round ending ' + etTime(R.end) + ' ET. Line ' + usd(R.line) + ', final ' + usd(fin) + ' (' + (d >= 0 ? '+' : '-') + usd(Math.abs(d)) + '). Watcher estimate; Kalshi settles on the CF Benchmarks index and may differ. Use Edit on the page if it is wrong.' + (R.locked.decision === 'TAKE' ? '\n' + paperLine() : ''), 'low', res === 'won' ? 'white_check_mark' : 'x', pageUrl() ? { click: pageUrl() + '/' } : null);
 }
 function rollRound(now) { while (now >= R.end) { finalize(); newRound(R.end + ROUND_MS * Math.max(1, Math.floor((now - R.end) / ROUND_MS))); } }
 function applyAutoLine(A, now) {
@@ -389,7 +437,9 @@ function lockLogic(A, now) {
     const decision = edge != null && edge >= CFG.minEdge && (cand.reason === 'All signs aligned' || A.checks.every(c => c.id !== 'price' || c.ok)) ? 'TAKE' : 'LEAN';
     const stake = (CFG.bankroll > 0 && decision === 'TAKE') ? CFG.bankroll * kelly(pr, ask + fee) : null;
     const passN = A.passN, total = A.total;
-    R.locked = { side: cand.side, t: now, px: A.price, gap: A.gap, prob: pr, rawProb: A.rawUp == null ? null : (sg > 0 ? A.rawUp : 1 - A.rawUp), ask, fee, edge, decision, stake, passN, total, reason: cand.reason, left: A.left };
+    let paperRec = null;
+    if (decision === 'TAKE') { const bal = paper().balance, z = paperSize(bal, pr, ask); paperRec = { balance: bal, contracts: z.n, cost: +(z.n * ask).toFixed(2), fee: orderFee(z.n, ask), sizing: z.mode }; }
+    R.locked = { side: cand.side, t: now, px: A.price, gap: A.gap, prob: pr, rawProb: A.rawUp == null ? null : (sg > 0 ? A.rawUp : 1 - A.rawUp), ask, fee, edge, decision, stake, passN, total, reason: cand.reason, left: A.left, paper: paperRec };
     const body = usd(A.price) + ' vs line ' + usd(R.line) + ' (' + (A.gap >= 0 ? '+' : '-') + usd(Math.abs(A.gap)) + ')\n' +
       'Model ' + pct(pr) + (ask != null ? ' vs ask ' + cents(ask) + ' + ' + cents(fee) + ' fee' : ' (no Kalshi price)') + (edge != null ? ' -> edge ' + (edge >= 0 ? '+' : '') + Math.round(edge * 100) + 'c' : '') + '\n' +
       'Checks ' + passN + '/' + total + ' passed. ' + cand.reason + '. ' + mmss(A.left) + ' left.' + (stake ? '\nQuarter-Kelly stake: ' + usd(stake, 0) : '');
@@ -430,7 +480,7 @@ function feedWatch(now) {
 }
 function heartbeat() {
   const now = Date.now(), st = stats(), live = liveFeeds(now).length;
-  push('Line Lock alive', 'Up ' + Math.round((now - BOOT) / 3600000) + 'h. ' + live + '/' + Object.keys(FEEDS).length + ' feeds live. Price ' + usd(STATUS.price) + '. Locked record ' + st.all.w + '-' + st.all.l + ', TAKE ' + st.take.w + '-' + st.take.l + ' (' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + '/contract). ' + ROUNDS.length + ' rounds logged.', 'min', 'heartbeat');
+  push('Line Lock alive', 'Up ' + Math.round((now - BOOT) / 3600000) + 'h. ' + live + '/' + Object.keys(FEEDS).length + ' feeds live. Price ' + usd(STATUS.price) + '. Locked record ' + st.all.w + '-' + st.all.l + ', TAKE ' + st.take.w + '-' + st.take.l + ' (' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + '/contract). ' + ROUNDS.length + ' rounds logged. ' + paperLine() + '.', 'min', 'heartbeat');
 }
 
 /* ---------- Kalshi settlement check: replace our estimate with the official result ---------- */
@@ -441,7 +491,7 @@ function pollSettle() {
     const m = j.market || {}, res = m.result;
     if (res === 'yes' || res === 'no') {
       const r = ROUNDS.find(x => x.id === p.id);
-      if (r) { const was = r.up; r.up = res === 'yes'; r.source = 'kalshi'; if (was != null && was !== r.up) { r.mismatch = true; console.log('Kalshi result differs from watcher estimate for', p.ticker); } saveRounds(); }
+      if (r) { const was = r.up; r.up = res === 'yes'; r.source = 'kalshi'; if (was != null && was !== r.up) { r.mismatch = true; console.log('Kalshi result differs from watcher estimate for', p.ticker); } saveRounds(); savePaper(); }
       S.pend.shift(); return;
     }
     throw new Error('not settled');
@@ -563,6 +613,7 @@ function page() {
     '<ul>' + rows + '</ul>' +
     '<h3>Scoreboard (saved on the server)</h3><p>All locks: ' + st.all.w + '-' + st.all.l + ' (' + wr(st.all.w, st.all.l) + ')' + (st.all.skip ? ', ' + st.all.skip + ' skipped' : '') + ' · TAKE only: ' + st.take.w + '-' + st.take.l + ' (' + wr(st.take.w, st.take.l) + '), P/L ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' per 1 contract after fees · ' + st.edited + ' edited · ' + ROUNDS.length + ' rounds logged' + (st.take.n < 200 ? ' · <i>under 200 TAKEs, too early to judge</i>' : '') + '</p>' +
     '<table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
+    paperCard() +
     '<h3>Calibration (snapshot at 4:00 left, every round)</h3><p>Brier score: model ' + (st.brier == null ? '--' : st.brier.toFixed(4)) + ' vs Kalshi price ' + (st.brierMkt == null ? '--' : st.brierMkt.toFixed(4)) + ' (lower is better; if Kalshi is lower, the market knows more than the model) · ' + st.nCal + ' rounds</p>' +
     '<table><tr><th>model said</th><th>rounds</th><th>avg said</th><th>actually won</th><th></th></tr>' + calRows + '</table>' +
     '<p>Alerts: ' + (s.topicSet ? 'topic set' : '<b>NTFY_TOPIC is not set</b>') + '</p>' +
@@ -573,6 +624,14 @@ function page() {
     'function send(b){var k=document.getElementById("ekey").value;localStorage.llkey=k;fetch("/api/rounds/"+cur+"/edit",{method:"POST",headers:{"Content-Type":"application/json","X-Edit-Key":k},body:JSON.stringify(b)}).then(function(r){return r.text().then(function(t){if(r.ok)location.reload();else document.getElementById("emsg").textContent=t})})}' +
     'function save(){var r=document.getElementById("eres").value;send({side:document.getElementById("eside").value,res:r==="auto"?null:r})}function clr(){send({clear:true})}' +
     'setInterval(function(){if(!editing)location.reload()},5000)</script></body>';
+}
+function paperCard() {
+  const P = paper(), sg = v => (v >= 0 ? '+' : '-') + usd(Math.abs(v)), tr = t => t ? sg(t.pnl) + ' (' + etDate(t.end) + ' ' + etTime(t.end) + ' ET, ' + t.contracts + 'x ' + esc(t.side) + ' @ ' + cents(t.ask) + ')' : '--';
+  return '<h3>Paper trading</h3><div style="border:1px solid #33435c;border-radius:8px;padding:8px 12px;display:inline-block">' +
+    'Balance <b>' + usd(P.balance) + '</b> (start ' + usd(P.start) + ', ' + (P.mode === 'kelly' ? 'quarter-Kelly capped, ' + usd(P.fixedStake, 0) + ' fallback' : 'fixed ' + usd(P.fixedStake, 0)) + ')<br>' +
+    'P/L <b style="color:' + (P.pnl >= 0 ? '#5fd38d' : '#ff6b6b') + '">' + sg(P.pnl) + '</b> · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + ' · win rate ' + pct(P.winRate) + ' (' + P.wins + '-' + P.losses + (P.open ? ', ' + P.open + ' open' : '') + ') · fees ' + usd(P.fees) + '<br>' +
+    'Max drawdown ' + usd(P.maxDrawdown) + ' (' + (P.maxDrawdownPct * 100).toFixed(1) + '%) · best ' + tr(P.best) + ' · worst ' + tr(P.worst) + '<br>' +
+    '<span style="color:#7a899f">Simulated buys at the ask at lock time on every TAKE; edits recompute it. <a style="color:#7a899f" href="/api/paper">json</a> · <a style="color:#7a899f" href="/api/export.csv">csv</a></span></div>';
 }
 function readBody(req) { return new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 10000) { no(new Error('too big')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); }); }
 function startServer() {
@@ -586,7 +645,9 @@ function startServer() {
       return res.end(JSON.stringify({ ok: !bad, liveFeeds: live, feeds: feedHealth(Date.now()) }));
     }
     if (u.pathname === '/status') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(STATUS, null, 2)); }
-    if (u.pathname === '/api/rounds') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ stats: stats(), rounds: ROUNDS.slice(-500) })); }
+    if (u.pathname === '/api/rounds') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ stats: stats(), paper: paper(), rounds: ROUNDS.slice(-500) })); }
+    if (u.pathname === '/api/paper') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(paper(), null, 2)); }
+    if (u.pathname === '/api/export.csv') { res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="line-lock-rounds.csv"' }); return res.end(exportCsv()); }
     const m = u.pathname.match(/^\/api\/rounds\/(\d+)\/edit$/);
     if (m && req.method === 'POST') {
       if (!CFG.editKey || req.headers['x-edit-key'] !== CFG.editKey) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('wrong or missing key (EDIT_KEY, or your NTFY_TOPIC if EDIT_KEY is not set)'); }
@@ -603,7 +664,7 @@ function startServer() {
         if (e.up == null && sd && (e.res === 'won' || e.res === 'lost')) e.up = (e.res === 'won') === (sd === 'UP');
         r.edit = e;
       }
-      saveRounds(); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, round: r, stats: stats() }));
+      saveRounds(); savePaper(); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, round: r, stats: stats(), paper: paper() }));
     }
     if (u.pathname === '/test') {
       if (!CFG.topic || u.searchParams.get('key') !== CFG.topic) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('Add ?key=YOUR_TOPIC_NAME to the address'); }
