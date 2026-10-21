@@ -1,6 +1,6 @@
 'use strict';
 /*
-  Line Lock watcher v1.1
+  Line Lock watcher v1.3
   Runs the same checks as the Line Lock page, 24/7, and sends a push through ntfy
   when a play locks. Read only: it never trades and never logs in anywhere.
 
@@ -27,6 +27,7 @@
     PAPER_BANKROLL  optional. Starting balance for the paper-trading tally. Default 1000
     PAPER_STAKE     optional. 'kelly' (default: KELLY_FRACTION of Kelly, capped at KELLY_CAP) or 'fixed'
     PAPER_FIXED_STAKE optional. Dollars per paper trade in fixed mode, or when Kelly gives nothing. Default 10
+    LEARN           optional. Set to 0 to turn off the loss feedback loop (defaults are used). LEARN_MIN_N default 30
     KALSHI_URL      optional. Link opened from the alert. Default https://kalshi.com/markets/<series>
 */
 const http = require('http');
@@ -55,7 +56,9 @@ const CFG = {
   feedAlerts: process.env.FEED_ALERTS !== '0',
   paperBank: num(process.env.PAPER_BANKROLL, 1000),
   paperMode: (process.env.PAPER_STAKE || 'kelly').toLowerCase() === 'fixed' ? 'fixed' : 'kelly',
-  paperFixed: num(process.env.PAPER_FIXED_STAKE, 10)
+  paperFixed: num(process.env.PAPER_FIXED_STAKE, 10),
+  learn: process.env.LEARN !== '0',
+  learnMinN: num(process.env.LEARN_MIN_N, 30)
 };
 CFG.kalshiUrl = process.env.KALSHI_URL || ('https://kalshi.com/markets/' + CFG.series.toLowerCase());
 const ROUND_MS = 900000;
@@ -105,6 +108,7 @@ function newRound(end) { R = { end, start: end - ROUND_MS, line: null, lineFrom:
 /* ---------- server-side round log (data/rounds.json) ---------- */
 const LOG_FILE = () => path.join(CFG.dataDir, 'rounds.json');
 let ROUNDS = [];
+function loadRoundsAndLearn() { loadRounds(); loadLearn(); }
 function loadRounds() {
   try { fs.mkdirSync(CFG.dataDir, { recursive: true }); } catch (e) { }
   try { ROUNDS = JSON.parse(fs.readFileSync(LOG_FILE(), 'utf8')); if (!Array.isArray(ROUNDS)) ROUNDS = []; }
@@ -150,6 +154,129 @@ function stats() {
   out.cal = B.map(b => ({ range: Math.round(b.lo * 100) + '-' + Math.min(100, Math.round(b.hi * 100)) + '%', n: b.n, avgP: b.n ? b.sumP / b.n : null, actual: b.n ? b.hit / b.n : null }));
   return out;
 }
+
+/* ---------- loss analysis (new in 1.3): why did settled locks lose? ---------- */
+const LOSS_REASONS = {
+  mismatch: 'Kalshi settlement differed from the watcher price estimate',
+  coinflip: 'Finished within a few dollars of the line (coin flip at the end)',
+  lateReverse: 'Was winning, then crossed the line in the last 2 minutes',
+  neverRight: 'Price was on the wrong side for most of the time after the lock',
+  thinGap: 'Gap at lock was small vs expected move (under 1.2 sigma)',
+  earlyLock: 'Locked with more than 8 minutes left: lots of time to reverse',
+  lowVolume: 'Spot volume at lock was thin (bottom third of all locks), so the move had little behind it',
+  volAgainst: 'Volume after the lock flowed against the call (net selling on UP / buying on DOWN)',
+  flowAgainst: 'Buy/sell flow at lock leaned against the call',
+  whaleAgainst: 'Net whale flow in the 5 minutes before lock was against the call',
+  marketDisagreed: 'Kalshi price disagreed with the model by 15+ points (market was right)',
+  expensive: 'Paid 80c or more: needs over 80% hit rate to profit',
+  thinEdge: 'Edge after fee was under 6c',
+  notTake: 'LEAN, not TAKE: the price check failed at lock',
+  whaleLock: 'Locked on a whale surge rather than all checks aligning',
+  failedChecks: 'Some checks were failing at lock time'
+};
+function lossReasons(r, volCut) {
+  const L = r.locked, C = L.ctx || {}, T = L.track || null, sg = effSide(r) === 'UP' ? 1 : -1, out = [];
+  const d = r.fin != null && r.line != null ? r.fin - r.line : null;
+  if (r.mismatch) out.push('mismatch');
+  if (d != null && C.sigUsd != null ? Math.abs(d) < 0.1 * C.sigUsd : (d != null && Math.abs(d) < 10)) out.push('coinflip');
+  if (T && T.crossedAt && r.end - T.crossedAt <= 120000 && T.ticks && T.wrongSideSecs / T.ticks < 0.5) out.push('lateReverse');
+  if (T && T.ticks && T.wrongSideSecs / T.ticks >= 0.5) out.push('neverRight');
+  const z = C.z != null ? Math.abs(C.z) : (L.gap != null && C.sigUsd ? Math.abs(L.gap) / C.sigUsd : null);
+  if (z != null && z < 1.2) out.push('thinGap');
+  if (L.left != null && L.left > 480) out.push('earlyLock');
+  if (C.vol60 != null && volCut != null && C.vol60 <= volCut) out.push('lowVolume');
+  if (T && (T.buyUsd + T.sellUsd) > 0 && sg * (T.buyUsd - T.sellUsd) / (T.buyUsd + T.sellUsd) < -0.1) out.push('volAgainst');
+  if (C.buyPct60 != null && sg * (C.buyPct60 - 50) < 0) out.push('flowAgainst');
+  if (C.whaleNet300 != null && sg * C.whaleNet300 < 0) out.push('whaleAgainst');
+  if (C.mktUp != null && L.prob != null) { const mk = sg > 0 ? C.mktUp : 1 - C.mktUp; if (L.prob - mk >= 0.15) out.push('marketDisagreed'); }
+  if (L.ask != null && L.ask >= 0.8) out.push('expensive');
+  if (L.edge != null && L.edge < 0.06) out.push('thinEdge');
+  if (L.decision !== 'TAKE') out.push('notTake');
+  if (/^Whale/.test(L.reason || '')) out.push('whaleLock');
+  if (L.total && L.passN < L.total) out.push('failedChecks');
+  return out;
+}
+function lossAnalysis() {
+  const settled = ROUNDS.filter(r => r.locked && (effRes(r) === 'won' || effRes(r) === 'lost')).sort((a, b) => a.end - b.end);
+  const vols = settled.map(r => r.locked.ctx && r.locked.ctx.vol60).filter(v => v != null).sort((a, b) => a - b);
+  const volCut = vols.length >= 6 ? vols[Math.floor(vols.length / 3)] : null;
+  const withCtx = settled.filter(r => r.locked.ctx).length;
+  const reasonCount = {}, wonWith = {};
+  Object.keys(LOSS_REASONS).forEach(k => { reasonCount[k] = 0; wonWith[k] = 0; });
+  const losses = [];
+  settled.forEach(r => {
+    const rs = lossReasons(r, volCut), lost = effRes(r) === 'lost';
+    rs.forEach(k => { if (lost) reasonCount[k]++; else wonWith[k]++; });
+    if (lost) { const L = r.locked, C = L.ctx || {}, T = L.track || {};
+      losses.push({ id: r.id, end: r.end, ticker: r.ticker || null, side: effSide(r), decision: L.decision, reason: L.reason, prob: L.prob, ask: L.ask, edge: L.edge,
+        leftAtLock: L.left == null ? null : Math.round(L.left), gapAtLock: L.gap, line: r.line, final: r.fin, finishMargin: r.fin != null && r.line != null ? +((effSide(r) === 'UP' ? 1 : -1) * (r.fin - r.line)).toFixed(2) : null,
+        vol60AtLock: C.vol60 == null ? null : C.vol60, buyPct60AtLock: C.buyPct60 == null ? null : C.buyPct60, volAfterLock: T.buyUsd != null ? Math.round(T.buyUsd + T.sellUsd) : null,
+        hasContext: !!L.ctx, reasons: rs.map(k => ({ id: k, text: LOSS_REASONS[k] })) }); }
+  });
+  /* a reason only "explains" losses if it shows up more in losses than in wins */
+  const nL = losses.length, nW = settled.length - nL;
+  const reasons = Object.keys(LOSS_REASONS).map(k => ({ id: k, text: LOSS_REASONS[k], losses: reasonCount[k], lossShare: nL ? reasonCount[k] / nL : null, winShare: nW ? wonWith[k] / nW : null,
+    winRateWhenPresent: (reasonCount[k] + wonWith[k]) ? wonWith[k] / (reasonCount[k] + wonWith[k]) : null }))
+    .filter(x => x.losses > 0).sort((a, b) => b.losses - a.losses);
+  const bucket = (name, fn, edges, fmt) => edges.slice(0, -1).map((lo, i) => { const hi = edges[i + 1], rs = settled.filter(r => { const v = fn(r); return v != null && v >= lo && v < hi; }), w = rs.filter(r => effRes(r) === 'won').length;
+    return { by: name, range: fmt(lo, hi), n: rs.length, wins: w, losses: rs.length - w, winRate: rs.length ? w / rs.length : null }; }).filter(b => b.n);
+  const C = r => r.locked.ctx || {};
+  const breakdowns = [].concat(
+    bucket('ask', r => r.locked.ask, [0, 0.5, 0.65, 0.8, 0.9, 1.01], (a, b) => Math.round(a * 100) + '-' + Math.min(100, Math.round(b * 100)) + 'c'),
+    bucket('edge', r => r.locked.edge, [-1, 0.04, 0.06, 0.1, 0.2, 1], (a, b) => (a < -0.5 ? '<' : Math.round(a * 100) + '-') + Math.round(b * 100) + 'c'),
+    bucket('minutes left at lock', r => r.locked.left == null ? null : r.locked.left / 60, [0, 2, 4, 8, 13], (a, b) => a + '-' + b),
+    bucket('gap sigma at lock', r => C(r).z == null ? null : Math.abs(C(r).z), [0, 0.8, 1.2, 2, 99], (a, b) => b > 50 ? a + '+' : a + '-' + b),
+    bucket('spot volume 60s at lock ($k)', r => C(r).vol60 == null ? null : C(r).vol60 / 1000, [0, 250, 500, 1000, 2500, 1e9], (a, b) => b > 1e8 ? a + '+' : a + '-' + b),
+    ['TAKE', 'LEAN'].map(d => { const rs = settled.filter(r => (r.locked.decision === 'TAKE') === (d === 'TAKE')), w = rs.filter(r => effRes(r) === 'won').length; return { by: 'decision', range: d, n: rs.length, wins: w, losses: rs.length - w, winRate: rs.length ? w / rs.length : null }; }).filter(b => b.n),
+    ['All signs aligned', 'Whale surge'].map(d => { const rs = settled.filter(r => (r.locked.reason || '').indexOf(d) === 0), w = rs.filter(r => effRes(r) === 'won').length; return { by: 'lock reason', range: d, n: rs.length, wins: w, losses: rs.length - w, winRate: rs.length ? w / rs.length : null }; }).filter(b => b.n));
+  return { settled: settled.length, wins: nW, losses: nL, lossRate: settled.length ? nL / settled.length : null, lowVolumeCutoff60s: volCut, roundsWithLockContext: withCtx,
+    note: withCtx < settled.length ? (settled.length - withCtx) + ' older locks were saved before v1.3 and have no volume/flow/path data; their reasons are limited to price, line, ask, edge, timing and lock type.' : null,
+    reasons, breakdowns, recentLosses: losses.slice(-50).reverse() };
+}
+
+/* ---------- feedback loop (new in 1.3): every settled loss re-runs the analysis and nudges a few knobs ----------
+   Each knob is tied to one loss cause. If, over >= LEARN_MIN_N settled locks, the cause shows up in at least 10
+   locks AND locks with that cause win 10+ points less often than locks without it, the knob tightens one step.
+   If the gap later closes (under 3 points), it relaxes one step back toward the default. Steps are small and bounded,
+   every change is appended to data/learn.json, LEARN=0 turns it off (defaults are used), and
+   POST /api/learn/reset (X-Edit-Key) reverts all knobs to defaults. */
+const KNOBS = {
+  minEdge: { cause: 'thinEdge', def: () => CFG.minEdge, step: 0.01, min: () => CFG.minEdge, max: () => CFG.minEdge + 0.06, text: 'min edge after fee for TAKE' },
+  minZ: { cause: 'thinGap', def: () => 0.8, step: 0.1, min: () => 0.8, max: () => 1.5, text: 'min gap (sigma) for the gap check' },
+  maxAsk: { cause: 'expensive', def: () => 0.99, step: -0.03, min: () => 0.8, max: () => 0.99, text: 'max ask paid for TAKE' },
+  maxLeft: { cause: 'earlyLock', def: () => 720, step: -60, min: () => 360, max: () => 720, text: 'latest lock time (seconds left)' },
+  minVol60: { cause: 'lowVolume', def: () => 0, step: 'cutoff', min: () => 0, max: () => Infinity, text: 'min 60s spot volume (USD) for TAKE' }
+};
+const LEARN_FILE = () => path.join(CFG.dataDir, 'learn.json');
+let LEARN = { knobs: {}, log: [], lastRun: null };
+function loadLearn() { try { const j = JSON.parse(fs.readFileSync(LEARN_FILE(), 'utf8')); if (j && j.knobs) LEARN = j; } catch (e) { } }
+function saveLearn() { try { fs.writeFileSync(LEARN_FILE(), JSON.stringify(LEARN, null, 2)); } catch (e) { console.log('could not save learn.json', e.message); } }
+function K_(k) { const d = KNOBS[k].def(); return CFG.learn && LEARN.knobs[k] != null ? LEARN.knobs[k] : d; }
+function learnFromLosses(trigger) {
+  const X = lossAnalysis(), now = Date.now();
+  LEARN.lastRun = { at: now, trigger, settled: X.settled, losses: X.losses, topCauses: X.reasons.slice(0, 5).map(r => r.id) };
+  if (!CFG.learn || X.settled < CFG.learnMinN) { saveLearn(); return LEARN; }
+  const base = X.settled ? X.wins / X.settled : 0;
+  Object.keys(KNOBS).forEach(k => {
+    const kb = KNOBS[k], r = X.reasons.find(x => x.id === kb.cause), cur = K_(k), def = kb.def();
+    const nWith = r ? r.losses + Math.round((r.winShare || 0) * X.wins) : 0, nWithout = X.settled - nWith;
+    const wrWith = r ? r.winRateWhenPresent : null, wrWithout = nWithout ? (X.wins - (nWith - (r ? r.losses : 0))) / nWithout : base;
+    let next = cur, why = null;
+    const gap = wrWith == null ? 0 : wrWithout - wrWith;
+    if (nWith >= 10 && nWithout >= 10 && gap >= 0.10) { why = 'tighten'; next = kb.step === 'cutoff' ? Math.max(cur, X.lowVolumeCutoff60s || 0) : cur + kb.step; }
+    else if (gap < 0.03 && cur !== def) { why = 'relax'; next = kb.step === 'cutoff' ? def : cur - kb.step; }
+    next = clamp(+next.toFixed(4), kb.min(), kb.max());
+    if (next !== cur) {
+      LEARN.knobs[k] = next;
+      LEARN.log.push({ at: now, knob: k, from: cur, to: next, action: why, cause: kb.cause, winRateWith: wrWith, winRateWithout: wrWithout, nWith, settled: X.settled, trigger });
+      if (LEARN.log.length > 1000) LEARN.log = LEARN.log.slice(-1000);
+      console.log('LEARN', why, k, cur, '->', next, 'cause', kb.cause);
+    }
+  });
+  saveLearn(); return LEARN;
+}
+const learnState = () => ({ enabled: CFG.learn, minSample: CFG.learnMinN, knobs: Object.keys(KNOBS).map(k => ({ knob: k, text: KNOBS[k].text, cause: KNOBS[k].cause, default: KNOBS[k].def(), current: K_(k), learned: LEARN.knobs[k] != null })), lastRun: LEARN.lastRun, log: LEARN.log.slice(-100).reverse() });
+function onSettled(r, trigger) { if (r && r.locked && effRes(r) === 'lost') { r.lossCauses = lossReasons(r, null); learnFromLosses(trigger + ':' + r.id); saveRounds(); } }
 
 /* ---------- paper trading: replayed from ROUNDS so edits recompute everything ---------- */
 const orderFee = (n, p) => n > 0 && p != null ? Math.ceil(7 * n * p * (1 - p) - 1e-9) / 100 : 0; /* Kalshi taker fee per order */
@@ -291,7 +418,7 @@ function feedHealth(now) {
 /* ---------- checks and analysis ---------- */
 function checksFor(sgn, c) {
   const out = [], side = sgn > 0 ? 'above' : 'below';
-  out.push({ id: 'gap', label: 'Gap beats the expected move', ok: c.z != null && sgn * c.z >= 0.8, detail: c.z == null ? 'no line' : fmtN(Math.abs(c.z), 1) + ' sigma, needs 0.8' });
+  out.push({ id: 'gap', label: 'Gap beats the expected move', ok: c.z != null && sgn * c.z >= K_('minZ'), detail: c.z == null ? 'no line' : fmtN(Math.abs(c.z), 1) + ' sigma, needs ' + fmtN(K_('minZ'), 1) });
   const on = c.live.filter(f => c.line != null && sgn * (f.p - c.line) > 0).length;
   out.push({ id: 'exch', label: 'Exchanges agree', ok: c.live.length >= 2 && on === c.live.length, detail: on + ' of ' + c.live.length + ' feeds ' + side + ' the line' });
   const fb = c.f60.buyPct, f5 = c.f300.buyPct;
@@ -304,7 +431,7 @@ function checksFor(sgn, c) {
   const kpS = sgn > 0 ? c.kpYes : c.kpNo;
   if (kpS != null && c.probUp != null) {
     const ps = sgn > 0 ? c.probUp : 1 - c.probUp, ask = kpS / 100, edge = ps - ask - kalshiFee(ask);
-    out.push({ id: 'price', label: 'Worth the price', ok: edge >= CFG.minEdge, edge, detail: 'blended ' + Math.round(ps * 100) + '% vs ' + Math.round(kpS) + 'c + ' + Math.round(kalshiFee(ask) * 100) + 'c fee = edge ' + (edge >= 0 ? '+' : '') + Math.round(edge * 100) + 'c, needs ' + Math.round(CFG.minEdge * 100) + 'c' });
+    out.push({ id: 'price', label: 'Worth the price', ok: edge >= K_('minEdge') && ask <= K_('maxAsk') && (c.f60.tot == null || c.f60.tot >= K_('minVol60')), edge, detail: 'blended ' + Math.round(ps * 100) + '% vs ' + Math.round(kpS) + 'c + ' + Math.round(kalshiFee(ask) * 100) + 'c fee = edge ' + (edge >= 0 ? '+' : '') + Math.round(edge * 100) + 'c, needs ' + Math.round(K_('minEdge') * 100) + 'c' + (ask > K_('maxAsk') ? ', ask over learned cap ' + cents(K_('maxAsk')) : '') + (c.f60.tot != null && c.f60.tot < K_('minVol60') ? ', 60s volume ' + usdK(c.f60.tot) + ' under learned floor ' + usdK(K_('minVol60')) : '') });
   }
   else out.push({ id: 'price', label: 'Worth the price', ok: true, na: true, detail: 'no Kalshi price' });
   return out;
@@ -408,7 +535,7 @@ function finalize() {
   const up = d == null || d === 0 ? null : d > 0;
   /* save every round (locked or not) so calibration has data; Kalshi's own result overwrites ours later */
   const rec = { id: R.end, end: R.end, ticker: R.ticker, line: R.line, lineFrom: R.lineFrom, fin, up, source: 'watcher', snap: R.snap, locked: R.locked };
-  ROUNDS = ROUNDS.filter(r => r.id !== rec.id); ROUNDS.push(rec); if (ROUNDS.length > 20000) ROUNDS = ROUNDS.slice(-20000); saveRounds(); savePaper();
+  ROUNDS = ROUNDS.filter(r => r.id !== rec.id); ROUNDS.push(rec); if (ROUNDS.length > 20000) ROUNDS = ROUNDS.slice(-20000); saveRounds(); savePaper(); onSettled(rec, 'watcher');
   if (R.ticker) S.pend.push({ id: rec.id, ticker: R.ticker, tries: 0 });
   if (!R.locked || fin == null) return;
   const res = d === 0 ? 'push' : (((d > 0) === (R.locked.side === 'UP')) ? 'won' : 'lost');
@@ -425,7 +552,7 @@ function applyAutoLine(A, now) {
 }
 function lockLogic(A, now) {
   if (R.locked || A.price == null || R.line == null || !A.side) { persist = 0; lastCand = null; return; }
-  const inWin = A.left <= 720 && A.left >= 45; let cand = null;
+  const inWin = A.left <= K_('maxLeft') && A.left >= 45; let cand = null;
   if (inWin && A.verdict === 'TAKE') cand = { side: A.side, reason: 'All signs aligned' };
   else if (inWin && A.whaleOk) cand = { side: A.surgeSgn > 0 ? 'UP' : 'DOWN', reason: 'Whale surge ' + (A.surgeSgn > 0 ? 'buying ' : 'selling ') + usdK(Math.abs(A.w90.net)) + ' in 90s' };
   if (cand && cand.side === lastCand) persist++; else persist = cand ? 1 : 0;
@@ -434,12 +561,13 @@ function lockLogic(A, now) {
     const sg = cand.side === 'UP' ? 1 : -1, pr = A.probUp == null ? null : (sg > 0 ? A.probUp : 1 - A.probUp), askC = sg > 0 ? A.kpYes : A.kpNo;
     const ask = askC == null ? null : askC / 100, fee = kalshiFee(ask), edge = (pr != null && ask != null) ? pr - ask - fee : null;
     /* a whale lock only counts as TAKE if the price still leaves an edge */
-    const decision = edge != null && edge >= CFG.minEdge && (cand.reason === 'All signs aligned' || A.checks.every(c => c.id !== 'price' || c.ok)) ? 'TAKE' : 'LEAN';
+    const decision = edge != null && edge >= K_('minEdge') && ask <= K_('maxAsk') && (cand.reason === 'All signs aligned' || A.checks.every(c => c.id !== 'price' || c.ok)) ? 'TAKE' : 'LEAN';
     const stake = (CFG.bankroll > 0 && decision === 'TAKE') ? CFG.bankroll * kelly(pr, ask + fee) : null;
     const passN = A.passN, total = A.total;
     let paperRec = null;
     if (decision === 'TAKE') { const bal = paper().balance, z = paperSize(bal, pr, ask); paperRec = { balance: bal, contracts: z.n, cost: +(z.n * ask).toFixed(2), fee: orderFee(z.n, ask), sizing: z.mode }; }
-    R.locked = { side: cand.side, t: now, px: A.price, gap: A.gap, prob: pr, rawProb: A.rawUp == null ? null : (sg > 0 ? A.rawUp : 1 - A.rawUp), ask, fee, edge, decision, stake, passN, total, reason: cand.reason, left: A.left, paper: paperRec };
+    R.locked = { side: cand.side, t: now, px: A.price, gap: A.gap, prob: pr, rawProb: A.rawUp == null ? null : (sg > 0 ? A.rawUp : 1 - A.rawUp), ask, fee, edge, decision, stake, passN, total, reason: cand.reason, left: A.left, paper: paperRec,
+      ctx: lockCtx(A) };
     const body = usd(A.price) + ' vs line ' + usd(R.line) + ' (' + (A.gap >= 0 ? '+' : '-') + usd(Math.abs(A.gap)) + ')\n' +
       'Model ' + pct(pr) + (ask != null ? ' vs ask ' + cents(ask) + ' + ' + cents(fee) + ' fee' : ' (no Kalshi price)') + (edge != null ? ' -> edge ' + (edge >= 0 ? '+' : '') + Math.round(edge * 100) + 'c' : '') + '\n' +
       'Checks ' + passN + '/' + total + ' passed. ' + cand.reason + '. ' + mmss(A.left) + ' left.' + (stake ? '\nQuarter-Kelly stake: ' + usd(stake, 0) : '');
@@ -454,6 +582,27 @@ function whaleHeadsUp(A, now) {
   R.surgeNotified = true;
   push('Whale surge ' + (A.surgeSgn > 0 ? 'buying' : 'selling'), usdK(Math.abs(A.w90.net)) + ' net in 90s. Price ' + usd(A.price) + (R.line != null ? ' vs line ' + usd(R.line) : '') + '. Not locked: ' + (A.whaleOk ? 'waiting to hold 4s' : 'line side, exchanges or RSI do not agree') + '.', 'default', 'whale');
 }
+/* market context saved with every lock (new in 1.3) so losses can be explained later.
+   Volume = USD traded on Coinbase/Kraken/Gemini spot fills the watcher collects. */
+function lockCtx(A) {
+  const r1 = v => v == null || !isFinite(v) ? null : Math.round(v), r3 = v => v == null || !isFinite(v) ? null : +v.toFixed(3);
+  return { z: r3(A.z), sigUsd: r1(A.sigUsd), mktUp: r3(A.mktUp), tilt: r3(A.tilt), rsi1: r1(A.rsi1),
+    vol60: r1(A.f60.tot), vol300: r1(A.f300.tot), buyPct60: r1(A.f60.buyPct), buyPct300: r1(A.f300.buyPct),
+    whaleNet300: r1(A.w300.net), failed: A.checks.filter(c => !c.na && !c.ok).map(c => c.id), patterns: A.firing.map(p => p.id) };
+}
+/* after a lock, follow price vs the line until the round ends: worst margin, last time it crossed, and
+   spot volume after the lock (did volume dry up or surge against the call?) */
+function trackLock(A, now) {
+  const L = R.locked; if (!L || A.price == null || R.line == null) return;
+  const sg = L.side === 'UP' ? 1 : -1, m = sg * (A.price - R.line);
+  const T = L.track || (L.track = { minMargin: m, minAt: now, crossedAt: null, wrongSideSecs: 0, ticks: 0, buyUsd: 0, sellUsd: 0, lastT: L.t });
+  T.ticks++; if (m < T.minMargin) { T.minMargin = +m.toFixed(2); T.minAt = now; }
+  if (m < 0) { T.wrongSideSecs++; if (T.prevM == null || T.prevM >= 0) T.crossedAt = now; }
+  T.prevM = m;
+  S.trades.forEach(t => { if (t.t > T.lastT && t.t <= now) { if (t.side === 'buy') T.buyUsd += t.usd; else T.sellUsd += t.usd; } });
+  T.lastT = now;
+}
+
 /* snapshot at 4 min left: this is what calibration is measured on, for every round */
 function leanLogic(A, now) {
   if (!R.lean && A.left <= 240 && A.left >= 150 && A.price != null && R.line != null && A.side) {
@@ -491,7 +640,7 @@ function pollSettle() {
     const m = j.market || {}, res = m.result;
     if (res === 'yes' || res === 'no') {
       const r = ROUNDS.find(x => x.id === p.id);
-      if (r) { const was = r.up; r.up = res === 'yes'; r.source = 'kalshi'; if (was != null && was !== r.up) { r.mismatch = true; console.log('Kalshi result differs from watcher estimate for', p.ticker); } saveRounds(); savePaper(); }
+      if (r) { const was = r.up; r.up = res === 'yes'; r.source = 'kalshi'; if (was != null && was !== r.up) { r.mismatch = true; console.log('Kalshi result differs from watcher estimate for', p.ticker); } saveRounds(); savePaper(); onSettled(r, 'kalshi'); }
       S.pend.shift(); return;
     }
     throw new Error('not settled');
@@ -504,7 +653,7 @@ function tick() {
   const pre = liveFeeds(now); if (pre.length) S.hist.push({ t: now, p: mean(pre.map(f => f.p)) });
   while (S.hist.length && S.hist[0].t < now - 20 * 60000) S.hist.shift();
   let A = analyze(now); applyAutoLine(A, now); if (R.line !== A.line) A = analyze(now);
-  lockLogic(A, now); leanLogic(A, now); whaleHeadsUp(A, now); feedWatch(now);
+  lockLogic(A, now); trackLock(A, now); leanLogic(A, now); whaleHeadsUp(A, now); feedWatch(now);
   S.liq = S.liq.filter(x => now - x.t <= 3600000);
   const fh = feedHealth(now);
   LASTA = A;
@@ -613,7 +762,7 @@ function page() {
     '<ul>' + rows + '</ul>' +
     '<h3>Scoreboard (saved on the server)</h3><p>All locks: ' + st.all.w + '-' + st.all.l + ' (' + wr(st.all.w, st.all.l) + ')' + (st.all.skip ? ', ' + st.all.skip + ' skipped' : '') + ' · TAKE only: ' + st.take.w + '-' + st.take.l + ' (' + wr(st.take.w, st.take.l) + '), P/L ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' per 1 contract after fees · ' + st.edited + ' edited · ' + ROUNDS.length + ' rounds logged' + (st.take.n < 200 ? ' · <i>under 200 TAKEs, too early to judge</i>' : '') + '</p>' +
     '<table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
-    paperCard() +
+    paperCard() + lossCard() +
     '<h3>Calibration (snapshot at 4:00 left, every round)</h3><p>Brier score: model ' + (st.brier == null ? '--' : st.brier.toFixed(4)) + ' vs Kalshi price ' + (st.brierMkt == null ? '--' : st.brierMkt.toFixed(4)) + ' (lower is better; if Kalshi is lower, the market knows more than the model) · ' + st.nCal + ' rounds</p>' +
     '<table><tr><th>model said</th><th>rounds</th><th>avg said</th><th>actually won</th><th></th></tr>' + calRows + '</table>' +
     '<p>Alerts: ' + (s.topicSet ? 'topic set' : '<b>NTFY_TOPIC is not set</b>') + '</p>' +
@@ -624,6 +773,22 @@ function page() {
     'function send(b){var k=document.getElementById("ekey").value;localStorage.llkey=k;fetch("/api/rounds/"+cur+"/edit",{method:"POST",headers:{"Content-Type":"application/json","X-Edit-Key":k},body:JSON.stringify(b)}).then(function(r){return r.text().then(function(t){if(r.ok)location.reload();else document.getElementById("emsg").textContent=t})})}' +
     'function save(){var r=document.getElementById("eres").value;send({side:document.getElementById("eside").value,res:r==="auto"?null:r})}function clr(){send({clear:true})}' +
     'setInterval(function(){if(!editing)location.reload()},5000)</script></body>';
+}
+function learnCard() {
+  const L = learnState(), f = (k, v) => k === 'minEdge' || k === 'maxAsk' ? cents(v) : k === 'minVol60' ? usdK(v) : String(v);
+  return '<p>Feedback loop: <b>' + (L.enabled ? 'on' : 'off (LEARN=0)') + '</b>, acts after ' + L.minSample + ' settled locks · ' + L.knobs.map(k => esc(k.text) + ' ' + f(k.knob, k.current) + (k.learned && k.current !== k.default ? ' <i>(default ' + f(k.knob, k.default) + ')</i>' : '')).join(' · ') +
+    ' · ' + L.log.length + ' changes <a style="color:#7a899f" href="/api/learn">log</a></p>';
+}
+function lossCard() {
+  const X = lossAnalysis(); if (!X.losses) return '<h3>Why it lost</h3><p>No settled losses yet.</p>';
+  const rr = X.reasons.slice(0, 10).map(x => '<tr><td>' + esc(x.text) + '</td><td>' + x.losses + '</td><td>' + pct(x.lossShare) + '</td><td>' + pct(x.winShare) + '</td><td>' + pct(x.winRateWhenPresent) + '</td></tr>').join('');
+  const br = X.breakdowns.map(b => '<tr><td>' + esc(b.by) + '</td><td>' + esc(b.range) + '</td><td>' + b.wins + '-' + b.losses + '</td><td>' + pct(b.winRate) + '</td></tr>').join('');
+  const lr = X.recentLosses.slice(0, 15).map(l => '<tr><td>' + etDate(l.end) + ' ' + etTime(l.end) + '</td><td>' + esc(l.side) + ' ' + esc(l.decision) + '</td><td>' + cents(l.ask) + '</td><td>' + (l.finishMargin == null ? '--' : usd(l.finishMargin)) + '</td><td>' + (l.vol60AtLock == null ? '--' : usdK(l.vol60AtLock)) + '</td><td>' + esc(l.reasons.map(x => x.text).join('; ') || 'no clear cause') + '</td></tr>').join('');
+  return '<h3>Why it lost</h3><p>' + X.losses + ' losses of ' + X.settled + ' settled locks (' + pct(X.lossRate) + ').' + (X.note ? ' <i>' + esc(X.note) + '</i>' : '') + ' <a style="color:#7a899f" href="/api/losses">json</a></p>' + learnCard() +
+    '<table><tr><th>likely cause</th><th>losses</th><th>% of losses</th><th>% of wins</th><th>win rate when present</th></tr>' + rr + '</table>' +
+    '<p style="color:#7a899f">A cause matters when it shows up much more in losses than in wins.</p>' +
+    '<table><tr><th>by</th><th>bucket</th><th>W-L</th><th>win rate</th></tr>' + br + '</table>' +
+    '<h4>Recent losses</h4><table><tr><th>round (ET)</th><th>call</th><th>ask</th><th>finished vs line</th><th>vol 60s</th><th>likely causes</th></tr>' + lr + '</table>';
 }
 function paperCard() {
   const P = paper(), sg = v => (v >= 0 ? '+' : '-') + usd(Math.abs(v)), tr = t => t ? sg(t.pnl) + ' (' + etDate(t.end) + ' ' + etTime(t.end) + ' ET, ' + t.contracts + 'x ' + esc(t.side) + ' @ ' + cents(t.ask) + ')' : '--';
@@ -646,6 +811,13 @@ function startServer() {
     }
     if (u.pathname === '/status') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(STATUS, null, 2)); }
     if (u.pathname === '/api/rounds') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ stats: stats(), paper: paper(), rounds: ROUNDS.slice(-500) })); }
+    if (u.pathname === '/api/losses') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(lossAnalysis(), null, 2)); }
+    if (u.pathname === '/api/learn' && req.method !== 'POST') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(learnState(), null, 2)); }
+    if (u.pathname === '/api/learn/reset' && req.method === 'POST') {
+      if (!CFG.editKey || req.headers['x-edit-key'] !== CFG.editKey) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('wrong or missing key'); }
+      const was = Object.assign({}, LEARN.knobs); LEARN.knobs = {}; LEARN.log.push({ at: Date.now(), action: 'reset', from: was }); saveLearn();
+      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(learnState()));
+    }
     if (u.pathname === '/api/paper') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(paper(), null, 2)); }
     if (u.pathname === '/api/export.csv') { res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="line-lock-rounds.csv"' }); return res.end(exportCsv()); }
     const m = u.pathname.match(/^\/api\/rounds\/(\d+)\/edit$/);
@@ -664,6 +836,7 @@ function startServer() {
         if (e.up == null && sd && (e.res === 'won' || e.res === 'lost')) e.up = (e.res === 'won') === (sd === 'UP');
         r.edit = e;
       }
+      onSettled(r, 'edit');
       saveRounds(); savePaper(); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, round: r, stats: stats(), paper: paper() }));
     }
     if (u.pathname === '/test') {
@@ -677,7 +850,7 @@ function startServer() {
 }
 
 function main() {
-  loadRounds();
+  loadRoundsAndLearn();
   newRound(Math.floor(Date.now() / ROUND_MS) * ROUND_MS + ROUND_MS);
   console.log('Line Lock watcher starting. Alerts topic set:', !!CFG.topic, '| whale size', usdK(CFG.whale), '| min edge', CFG.minEdge, '| shrink', CFG.shrink);
   startServer();
@@ -697,4 +870,4 @@ function main() {
   }
 }
 if (require.main === module) main();
-module.exports = { S, CFG, tick, newRound, getR: () => R, push, checksFor, analyze, getStatus: () => STATUS, stats, kalshiFee, kelly, effRes };
+module.exports = { learnFromLosses, learnState, K_, lossAnalysis, lossReasons, getRounds: () => ROUNDS, setRounds: x => { ROUNDS = x; }, S, CFG, tick, newRound, getR: () => R, push, checksFor, analyze, getStatus: () => STATUS, stats, kalshiFee, kelly, effRes };
