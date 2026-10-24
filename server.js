@@ -423,6 +423,39 @@ function applyAutoLine(A, now) {
   const c = S.candles.get(R.start);
   if (c) { R.line = c.o; R.lineFrom = 'candle'; } else if (R.line == null && A.price != null && now - R.start < 30000) { R.line = A.price; R.lineFrom = 'price'; }
 }
+/* ---------- loss learning: learn from TAKE losses, then downgrade bad segments ---------- */
+/* A segment only becomes a rule when it has lost enough, on enough trades, to trust:
+   at least 12 TAKEs, at least 4 losses, and a win rate at least 10 points below
+   its breakeven win rate (mean ask). This stops one bad day from banning a good setup. */
+const LOSS_SEGMENTS = [
+  { id: 'high-ask', label: 'Ask 70c or higher', test: (side, prob, ask, edge, r) => ask != null && ask >= 0.70 },
+  { id: 'high-ask-small-edge', label: 'Ask 70c+ with under 8c edge', test: (side, prob, ask, edge, r) => ask != null && ask >= 0.70 && edge != null && edge < 0.08 },
+  { id: 'small-edge', label: 'Edge under 7c', test: (side, prob, ask, edge, r) => edge != null && edge < 0.07 },
+  { id: 'low-model', label: 'Model under 70%', test: (side, prob, ask, edge, r) => prob != null && prob < 0.70 },
+  { id: 'up', label: 'UP calls', test: (side, prob, ask, edge, r) => side === 'UP' },
+  { id: 'down', label: 'DOWN calls', test: (side, prob, ask, edge, r) => side === 'DOWN' },
+  { id: 'mismatch', label: 'Kalshi settlement differed', test: (side, prob, ask, edge, r) => !!(r && r.mismatch) }
+];
+function lossSegmentStats() {
+  const takes = ROUNDS.filter(r => r.locked && r.locked.decision === 'TAKE' && (effRes(r) === 'won' || effRes(r) === 'lost'));
+  return LOSS_SEGMENTS.map(seg => {
+    const rows = takes.filter(r => { const L = r.locked; return seg.test(effSide(r), L.prob, L.ask, L.edge, r); });
+    const w = rows.filter(r => effRes(r) === 'won').length, l = rows.length - w;
+    const meanAsk = rows.length ? rows.reduce((s, r) => s + (r.locked.ask || 0), 0) / rows.length : null;
+    const pnl = rows.reduce((s, r) => s + ((effRes(r) === 'won' ? 1 : 0) - (r.locked.ask || 0) - kalshiFee(r.locked.ask || 0)), 0);
+    return { id: seg.id, label: seg.label, test: seg.test, n: rows.length, w, l, winRate: rows.length ? w / rows.length : null, breakeven: meanAsk, pnlPerContract: rows.length ? pnl / rows.length : null };
+  });
+}
+function lossLearn() {
+  const segments = lossSegmentStats();
+  const rules = segments.filter(sg => sg.n >= 12 && sg.l >= 4 && sg.winRate != null && sg.breakeven != null && sg.winRate < sg.breakeven - 0.10)
+    .map(sg => ({ id: sg.id, label: sg.label, n: sg.n, w: sg.w, l: sg.l, winRate: sg.winRate, breakeven: sg.breakeven, matches: (side, prob, ask, edge) => { const seg = LOSS_SEGMENTS.find(x => x.id === sg.id); return seg ? seg.test(side, prob, ask, edge, null) : false; } }));
+  const settled = ROUNDS.filter(r => r.locked && r.locked.decision === 'TAKE' && (effRes(r) === 'won' || effRes(r) === 'lost')).sort((a, b) => a.end - b.end);
+  let consec = 0; for (let k = settled.length - 1; k >= 0; k--) { if (effRes(settled[k]) === 'lost') consec++; else break; }
+  const last6 = settled.slice(-6), last6Losses = last6.filter(r => effRes(r) === 'lost').length;
+  const brake = consec >= 3 || last6Losses >= 5;
+  return { segments, rules, brake, consec, last6Losses };
+}
 function lockLogic(A, now) {
   if (R.locked || A.price == null || R.line == null || !A.side) { persist = 0; lastCand = null; return; }
   const inWin = A.left <= 720 && A.left >= 45; let cand = null;
@@ -434,12 +467,19 @@ function lockLogic(A, now) {
     const sg = cand.side === 'UP' ? 1 : -1, pr = A.probUp == null ? null : (sg > 0 ? A.probUp : 1 - A.probUp), askC = sg > 0 ? A.kpYes : A.kpNo;
     const ask = askC == null ? null : askC / 100, fee = kalshiFee(ask), edge = (pr != null && ask != null) ? pr - ask - fee : null;
     /* a whale lock only counts as TAKE if the price still leaves an edge */
-    const decision = edge != null && edge >= CFG.minEdge && (cand.reason === 'All signs aligned' || A.checks.every(c => c.id !== 'price' || c.ok)) ? 'TAKE' : 'LEAN';
+    let decision = edge != null && edge >= CFG.minEdge && (cand.reason === 'All signs aligned' || A.checks.every(c => c.id !== 'price' || c.ok)) ? 'TAKE' : 'LEAN';
+    let learnReason = null;
+    if (decision === 'TAKE') {
+      const learn = lossLearn();
+      if (learn.brake) { decision = 'LEAN'; learnReason = 'loss brake: ' + learn.consec + ' TAKE losses in a row, ' + learn.last6Losses + ' in the last 6'; }
+      else { const hit = learn.rules.find(ru => ru.matches(cand.side, pr, ask, edge)); if (hit) { decision = 'LEAN'; learnReason = 'loss rule: ' + hit.label + ' (' + hit.w + '-' + hit.l + ', ' + Math.round(hit.winRate * 100) + '% vs ' + Math.round(hit.breakeven * 100) + '% breakeven)'; } }
+      if (learnReason) console.log('LOSS-LEARN downgrade to LEAN:', learnReason);
+    }
     const stake = (CFG.bankroll > 0 && decision === 'TAKE') ? CFG.bankroll * kelly(pr, ask + fee) : null;
     const passN = A.passN, total = A.total;
     let paperRec = null;
     if (decision === 'TAKE') { const bal = paper().balance, z = paperSize(bal, pr, ask); paperRec = { balance: bal, contracts: z.n, cost: +(z.n * ask).toFixed(2), fee: orderFee(z.n, ask), sizing: z.mode }; }
-    R.locked = { side: cand.side, t: now, px: A.price, gap: A.gap, prob: pr, rawProb: A.rawUp == null ? null : (sg > 0 ? A.rawUp : 1 - A.rawUp), ask, fee, edge, decision, stake, passN, total, reason: cand.reason, left: A.left, paper: paperRec };
+    R.locked = { side: cand.side, t: now, px: A.price, gap: A.gap, prob: pr, rawProb: A.rawUp == null ? null : (sg > 0 ? A.rawUp : 1 - A.rawUp), ask, fee, edge, decision, stake, passN, total, reason: cand.reason, left: A.left, paper: paperRec, rsi1: A.rsi1, rsi5: A.rsi5, ema9: A.ema9, ema21: A.ema21, whaleNet5m: A.w300.net, buyPct60: A.f60.buyPct, sigUsd: A.sigUsd, z: A.z, learnReason };
     const body = usd(A.price) + ' vs line ' + usd(R.line) + ' (' + (A.gap >= 0 ? '+' : '-') + usd(Math.abs(A.gap)) + ')\n' +
       'Model ' + pct(pr) + (ask != null ? ' vs ask ' + cents(ask) + ' + ' + cents(fee) + ' fee' : ' (no Kalshi price)') + (edge != null ? ' -> edge ' + (edge >= 0 ? '+' : '') + Math.round(edge * 100) + 'c' : '') + '\n' +
       'Checks ' + passN + '/' + total + ' passed. ' + cand.reason + '. ' + mmss(A.left) + ' left.' + (stake ? '\nQuarter-Kelly stake: ' + usd(stake, 0) : '');
@@ -590,6 +630,9 @@ function connectLiq() {
 function page() {
   const s = STATUS, rows = (s.checks || []).map(c => '<li>' + esc(c) + '</li>').join('');
   const st = stats();
+  const learn1 = lossLearn();
+  const rulesHtml = learn1.rules.length ? learn1.rules.map(ru => esc(ru.label) + ' (' + ru.w + '-' + ru.l + ', ' + Math.round(ru.winRate * 100) + '% vs ' + Math.round(ru.breakeven * 100) + '% breakeven)').join(' · ') : 'No segment has lost enough, on enough trades, to ban yet (needs 12+ TAKEs, 4+ losses, win rate 10+ points below breakeven).';
+  const brakeHtml = learn1.brake ? ' Loss brake active: ' + learn1.consec + ' TAKE losses in a row.' : '';
   const fh = s.feedHealth || {};
   const feeds = Object.keys(fh).map(k => '<span style="color:' + (fh[k] === 'ok' ? '#5fd38d' : '#ff6b6b') + '">' + esc(FEEDS[k].name) + ': ' + esc(fh[k]) + '</span>').join(' · ');
   const wr = (w, l) => (w + l) ? Math.round(w / (w + l) * 100) + '%' : '--';
@@ -612,6 +655,7 @@ function page() {
     '<p>' + feeds + '</p>' +
     '<ul>' + rows + '</ul>' +
     '<h3>Scoreboard (saved on the server)</h3><p>All locks: ' + st.all.w + '-' + st.all.l + ' (' + wr(st.all.w, st.all.l) + ')' + (st.all.skip ? ', ' + st.all.skip + ' skipped' : '') + ' · TAKE only: ' + st.take.w + '-' + st.take.l + ' (' + wr(st.take.w, st.take.l) + '), P/L ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' per 1 contract after fees · ' + st.edited + ' edited · ' + ROUNDS.length + ' rounds logged' + (st.take.n < 200 ? ' · <i>under 200 TAKEs, too early to judge</i>' : '') + '</p>' +
+    '<p><b>Loss learning:</b> ' + rulesHtml + brakeHtml + '</p>' +
     '<table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
     paperCard() +
     '<h3>Calibration (snapshot at 4:00 left, every round)</h3><p>Brier score: model ' + (st.brier == null ? '--' : st.brier.toFixed(4)) + ' vs Kalshi price ' + (st.brierMkt == null ? '--' : st.brierMkt.toFixed(4)) + ' (lower is better; if Kalshi is lower, the market knows more than the model) · ' + st.nCal + ' rounds</p>' +
@@ -697,4 +741,4 @@ function main() {
   }
 }
 if (require.main === module) main();
-module.exports = { S, CFG, tick, newRound, getR: () => R, push, checksFor, analyze, getStatus: () => STATUS, stats, kalshiFee, kelly, effRes };
+module.exports = { S, CFG, tick, newRound, getR: () => R, push, checksFor, analyze, getStatus: () => STATUS, stats, kalshiFee, kelly, effRes, lossLearn, lossSegmentStats };
