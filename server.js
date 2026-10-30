@@ -423,6 +423,10 @@ function applyAutoLine(A, now) {
   const c = S.candles.get(R.start);
   if (c) { R.line = c.o; R.lineFrom = 'candle'; } else if (R.line == null && A.price != null && now - R.start < 30000) { R.line = A.price; R.lineFrom = 'price'; }
 }
+/* ---------- loss learning: learn from TAKE losses, then downgrade bad segments ---------- */
+/* A segment only becomes a rule when it has lost enough, on enough trades, to trust:
+   at least 12 TAKEs, at least 4 losses, and a win rate at least 10 points below
+   its breakeven win rate (mean ask). This stops one bad day from banning a good setup. */
 function lockLogic(A, now) {
   if (R.locked || A.price == null || R.line == null || !A.side) { persist = 0; lastCand = null; return; }
   const inWin = A.left <= 720 && A.left >= 45; let cand = null;
@@ -434,7 +438,7 @@ function lockLogic(A, now) {
     const sg = cand.side === 'UP' ? 1 : -1, pr = A.probUp == null ? null : (sg > 0 ? A.probUp : 1 - A.probUp), askC = sg > 0 ? A.kpYes : A.kpNo;
     const ask = askC == null ? null : askC / 100, fee = kalshiFee(ask), edge = (pr != null && ask != null) ? pr - ask - fee : null;
     /* a whale lock only counts as TAKE if the price still leaves an edge */
-    const decision = edge != null && edge >= CFG.minEdge && (cand.reason === 'All signs aligned' || A.checks.every(c => c.id !== 'price' || c.ok)) ? 'TAKE' : 'LEAN';
+    let decision = edge != null && edge >= CFG.minEdge && (cand.reason === 'All signs aligned' || A.checks.every(c => c.id !== 'price' || c.ok)) ? 'TAKE' : 'LEAN';
     const stake = (CFG.bankroll > 0 && decision === 'TAKE') ? CFG.bankroll * kelly(pr, ask + fee) : null;
     const passN = A.passN, total = A.total;
     let paperRec = null;
@@ -591,33 +595,38 @@ function page() {
   const s = STATUS, rows = (s.checks || []).map(c => '<li>' + esc(c) + '</li>').join('');
   const st = stats();
   const fh = s.feedHealth || {};
-  const feeds = Object.keys(fh).map(k => '<span style="color:' + (fh[k] === 'ok' ? '#5fd38d' : '#ff6b6b') + '">' + esc(FEEDS[k].name) + ': ' + esc(fh[k]) + '</span>').join(' · ');
+  const feeds = Object.keys(fh).map(k => '<span style="color:' + (fh[k] === 'ok' ? '#34d399' : '#fb7185') + '">' + esc(FEEDS[k].name) + ': ' + esc(fh[k]) + '</span>').join(' · ');
   const wr = (w, l) => (w + l) ? Math.round(w / (w + l) * 100) + '%' : '--';
   const locked = ROUNDS.filter(r => r.locked).slice(-40).reverse();
   const recRows = locked.map(r => {
     const res = effRes(r) || 'pending', side = effSide(r), L = r.locked;
-    const col = res === 'won' ? '#5fd38d' : res === 'lost' ? '#ff6b6b' : '#c9a227';
+    const col = res === 'won' ? '#34d399' : res === 'lost' ? '#fb7185' : '#fbbf24';
     return '<tr><td>' + etDate(r.end) + ' ' + etTime(r.end) + '</td><td>' + esc(side) + (r.edit && r.edit.side && r.edit.side !== L.side ? ' (was ' + esc(L.side) + ')' : '') + '</td><td>' + esc(L.decision || '--') + '</td><td>' + pct(L.prob) + '</td><td>' + cents(L.ask) + '</td><td>' + (L.edge == null ? '--' : (L.edge >= 0 ? '+' : '') + Math.round(L.edge * 100) + 'c') + '</td><td>' + fmtN(r.line, 0) + ' &rarr; ' + fmtN(r.fin, 0) + '</td><td style="color:' + col + '">' + esc(res) + (r.edit ? ' <i title="edited ' + esc(new Date(r.edit.at).toISOString()) + '">(edited)</i>' : '') + (r.source === 'kalshi' ? ' &#10003;K' : '') + (r.mismatch ? ' <b title="Kalshi result differed from the watcher estimate">!</b>' : '') + '</td>' +
       '<td><button onclick="ed(' + r.id + ',\'' + esc(side) + '\',\'' + esc(res) + '\')">Edit</button></td></tr>';
   }).join('') || '<tr><td colspan="9">none yet</td></tr>';
-  const calRows = st.cal.map(b => '<tr><td>' + b.range + '</td><td>' + b.n + '</td><td>' + pct(b.avgP) + '</td><td>' + pct(b.actual) + '</td><td>' + (b.n >= 20 && b.actual != null ? (b.actual < b.avgP - 0.05 ? '<span style="color:#ff6b6b">overconfident</span>' : b.actual > b.avgP + 0.05 ? 'underconfident' : '<span style="color:#5fd38d">ok</span>') : 'need 20+') + '</td></tr>').join('');
-  const td = 'style="padding:2px 8px"';
+  const calRows = st.cal.map(b => '<tr><td>' + b.range + '</td><td>' + b.n + '</td><td>' + pct(b.avgP) + '</td><td>' + pct(b.actual) + '</td><td>' + (b.n >= 20 && b.actual != null ? (b.actual < b.avgP - 0.05 ? '<span style="color:#fb7185">overconfident</span>' : b.actual > b.avgP + 0.05 ? 'underconfident' : '<span style="color:#34d399">ok</span>') : 'need 20+') + '</td></tr>').join('');
+  const P = paper();
+  const leanPct = s.prob == null ? 0 : Math.min(100, Math.max(0, s.prob));
+  const heroTitle = s.locked ? 'LOCKED ' + esc(s.locked.side) + ' (' + esc(s.locked.decision) + ')' : 'Watching';
+  const heroReason = s.locked ? esc(s.locked.reason) : 'Waiting for the next lock';
   return '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Line Lock watcher</title>' +
-    '<style>table{border-collapse:collapse}td,th{padding:2px 8px;border-bottom:1px solid #1d2635;text-align:left}button{background:#1d2635;color:#e8eef8;border:1px solid #33435c;border-radius:4px;cursor:pointer}#edbox{display:none;position:fixed;top:20%;left:50%;transform:translateX(-50%);background:#121a26;border:1px solid #33435c;padding:16px;border-radius:8px}select,input{background:#0a0e15;color:#e8eef8;border:1px solid #33435c}</style>' +
-    '<body style="font:14px/1.5 ui-monospace,monospace;background:#0a0e15;color:#e8eef8;padding:16px"><h2>Line Lock watcher</h2>' +
-    '<p>' + (s.locked ? '<b>LOCKED ' + esc(s.locked.side) + ' (' + esc(s.locked.decision) + ')</b> · ' + esc(s.locked.reason) : 'Watching') + ' · ' + (s.left || '--') + ' left</p>' +
-    '<p>price ' + usd(s.price) + ' (avg of live feeds, approx. of the CF Benchmarks index Kalshi settles on) · line ' + usd(s.line) + ' (' + (s.lineFrom || '--') + ') · lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '% · ' + (s.verdict || '--') + '</p>' +
-    '<p>model up ' + (s.rawProbUp == null ? '--' : s.rawProbUp + '%') + ' · Kalshi up ' + (s.marketProbUp == null ? '--' : s.marketProbUp + '%') + ' · blended ' + (s.side || '') + ' ' + (s.prob || '--') + '% · edge ' + (s.edgeCents == null ? '--' : (s.edgeCents >= 0 ? '+' : '') + s.edgeCents + 'c') + (s.stake ? ' · quarter-Kelly ' + usd(s.stake, 0) : '') + '</p>' +
-    '<p>' + (s.feeds || 0) + ' feeds live · RSI 1m ' + (s.rsi1 == null ? '--' : s.rsi1) + ' · whale net 5m ' + (s.whaleNet5m == null ? '--' : usdK(s.whaleNet5m)) + (s.surge ? ' · SURGE' : '') + '</p>' +
-    '<p>' + feeds + '</p>' +
-    '<ul>' + rows + '</ul>' +
-    '<h3>Scoreboard (saved on the server)</h3><p>All locks: ' + st.all.w + '-' + st.all.l + ' (' + wr(st.all.w, st.all.l) + ')' + (st.all.skip ? ', ' + st.all.skip + ' skipped' : '') + ' · TAKE only: ' + st.take.w + '-' + st.take.l + ' (' + wr(st.take.w, st.take.l) + '), P/L ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' per 1 contract after fees · ' + st.edited + ' edited · ' + ROUNDS.length + ' rounds logged' + (st.take.n < 200 ? ' · <i>under 200 TAKEs, too early to judge</i>' : '') + '</p>' +
-    '<table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
+    '<style>body{max-width:720px;margin:0 auto}h2{font-size:30px;letter-spacing:-.03em;font-weight:800}h3{font-size:19px;margin:32px 4px 12px;color:#cbd2e1}.card{background:linear-gradient(180deg,#1b1e2a,#14161f);border:1px solid #262a38;border-radius:24px;padding:18px 20px;margin:14px 0;box-shadow:0 8px 24px rgba(0,0,0,.28);overflow-wrap:anywhere}.hero{border:1px solid transparent;background:linear-gradient(#171924,#171924) padding-box,linear-gradient(135deg,#7c5cff,#00c2ff,#34d399) border-box}.big{font-size:42px;font-weight:800;letter-spacing:-.03em;line-height:1.1}.muted{color:#9aa3b2;font-size:14px}.pill{display:inline-block;padding:5px 12px;border-radius:999px;font-weight:700;font-size:14px;background:rgba(52,211,153,.15);color:#34d399}.pill-tape{background:rgba(124,92,255,.18);color:#c4b5fd}.bar{height:10px;border-radius:999px;background:#262a38;overflow:hidden;margin:10px 0}.bar>div{height:100%;background:linear-gradient(90deg,#7c5cff,#00c2ff)}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.grid .card{margin:0}table{border-collapse:collapse;width:100%;background:#14161f;border:1px solid #262a38;border-radius:20px;overflow:hidden;display:block;overflow-x:auto}td,th{padding:12px 14px;border-bottom:1px solid #222634;text-align:left;white-space:nowrap}th{font-size:13px;color:#9aa3b2;font-weight:600}button{background:linear-gradient(135deg,#7c5cff,#00c2ff);color:#fff;border:0;border-radius:999px;padding:10px 18px;font-weight:700;cursor:pointer;min-height:42px}select,input{background:#1b1e2a;color:#eef1f6;border:1px solid #2c3245;border-radius:14px;padding:11px 14px;min-height:42px}a{color:#7dd3fc;text-decoration:none}#edbox{display:none;position:fixed;top:18%;left:50%;transform:translateX(-50%);background:#1b1e2a;border:1px solid #2c3245;padding:20px;border-radius:20px;box-shadow:0 12px 32px rgba(0,0,0,.4);width:min(92vw,380px);z-index:10}details summary{cursor:pointer;color:#cbd2e1}@media(max-width:560px){.grid{grid-template-columns:1fr 1fr}.big{font-size:34px}}</style>' +
+    '<body style="font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0d12;color:#eef1f6;padding:16px"><h2>Line Lock</h2><p class="muted" style="margin-top:-8px">BTC 15-minute watcher · Live</p>' +
+    '<div class="card hero"><span class="pill">&#9679; ' + heroTitle + '</span> <span class="pill pill-tape">' + heroReason + '</span>' +
+    '<div class="big" style="margin-top:12px">' + (s.price == null ? '--' : usd(s.price)) + '</div>' +
+    '<div class="muted">Line ' + (s.line == null ? '--' : usd(s.line)) + ' (' + (s.lineFrom || '--') + ') · ' + (s.left || '--') + ' left · lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '% · ' + (s.verdict || '--') + '</div>' +
+    '<div style="margin-top:14px"><b>Lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '%</b> <span class="muted">· model up ' + (s.rawProbUp == null ? '--' : s.rawProbUp + '%') + ' · Kalshi up ' + (s.marketProbUp == null ? '--' : s.marketProbUp + '%') + ' · edge ' + (s.edgeCents == null ? '--' : (s.edgeCents >= 0 ? '+' : '') + s.edgeCents + 'c') + (s.stake ? ' · quarter-Kelly ' + usd(s.stake, 0) : '') + '</span></div>' +
+    '<div class="bar"><div style="width:' + leanPct + '%"></div></div>' +
+    '<div class="muted">' + (s.feeds || 0) + ' feeds live · RSI 1m ' + (s.rsi1 == null ? '--' : s.rsi1) + ' · whale net 5m ' + (s.whaleNet5m == null ? '--' : usdK(s.whaleNet5m)) + (s.surge ? ' · SURGE' : '') + '</div>' +
+    '<div style="margin-top:8px">' + feeds + '</div></div>' +
+    '<div class="grid"><div class="card"><div class="muted">All locks</div><div style="font-size:26px;font-weight:800">' + wr(st.all.w, st.all.l) + '</div><div class="muted">' + st.all.w + '-' + st.all.l + '</div></div><div class="card"><div class="muted">TAKE only</div><div style="font-size:26px;font-weight:800">' + wr(st.take.w, st.take.l) + '</div><div class="muted">' + st.take.w + '-' + st.take.l + ' · ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' / contract</div></div><div class="card"><div class="muted">Paper balance</div><div style="font-size:26px;font-weight:800">' + usd(P.balance) + '</div><div class="muted">' + (P.pnl >= 0 ? '+' : '-') + usd(Math.abs(P.pnl)) + ' · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + '</div></div></div>' +
+    '<div class="card"><h3 style="margin:0 0 8px">Checks</h3><ul style="margin:8px 0;padding-left:20px">' + rows + '</ul></div>' +
+    '<h3>Recent rounds</h3><table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
     paperCard() +
-    '<h3>Calibration (snapshot at 4:00 left, every round)</h3><p>Brier score: model ' + (st.brier == null ? '--' : st.brier.toFixed(4)) + ' vs Kalshi price ' + (st.brierMkt == null ? '--' : st.brierMkt.toFixed(4)) + ' (lower is better; if Kalshi is lower, the market knows more than the model) · ' + st.nCal + ' rounds</p>' +
+    '<h3>Calibration (snapshot at 4:00 left, every round)</h3><div class="card"><p style="margin:0">Brier score: model ' + (st.brier == null ? '--' : st.brier.toFixed(4)) + ' vs Kalshi price ' + (st.brierMkt == null ? '--' : st.brierMkt.toFixed(4)) + ' (lower is better; if Kalshi is lower, the market knows more than the model) · ' + st.nCal + ' rounds</p></div>' +
     '<table><tr><th>model said</th><th>rounds</th><th>avg said</th><th>actually won</th><th></th></tr>' + calRows + '</table>' +
-    '<p>Alerts: ' + (s.topicSet ? 'topic set' : '<b>NTFY_TOPIC is not set</b>') + '</p>' +
-    '<p style="color:#7a899f">' + esc(JSON.stringify(s.diag || {})) + '</p>' +
+    '<p class="muted">Alerts: ' + (s.topicSet ? 'topic set' : '<b>NTFY_TOPIC is not set</b>') + ' · ' + ROUNDS.length + ' rounds logged · ' + st.edited + ' edited</p>' +
+    '<details><summary>Diagnostics</summary><p class="muted">' + esc(JSON.stringify(s.diag || {})) + '</p></details>' +
     '<div id="edbox"><b>Edit round</b><br>Call: <select id="eside"><option>UP</option><option>DOWN</option></select><br>Result: <select id="eres"><option value="auto">auto (from price)</option><option value="won">won</option><option value="lost">lost</option><option value="skip">skip (did not trade / ignore)</option></select><br>Key: <input id="ekey" type="password" placeholder="EDIT_KEY"><br><button onclick="save()">Save</button> <button onclick="clr()">Undo edit</button> <button onclick="cls()">Cancel</button> <span id="emsg"></span></div>' +
     '<script>var cur=null,editing=false;function ed(id,side,res){cur=id;editing=true;document.getElementById("eside").value=side;document.getElementById("eres").value=(res==="won"||res==="lost"||res==="skip")?res:"auto";document.getElementById("ekey").value=localStorage.llkey||"";document.getElementById("edbox").style.display="block"}' +
     'function cls(){editing=false;document.getElementById("edbox").style.display="none"}' +
@@ -627,9 +636,9 @@ function page() {
 }
 function paperCard() {
   const P = paper(), sg = v => (v >= 0 ? '+' : '-') + usd(Math.abs(v)), tr = t => t ? sg(t.pnl) + ' (' + etDate(t.end) + ' ' + etTime(t.end) + ' ET, ' + t.contracts + 'x ' + esc(t.side) + ' @ ' + cents(t.ask) + ')' : '--';
-  return '<h3>Paper trading</h3><div style="border:1px solid #33435c;border-radius:8px;padding:8px 12px;display:inline-block">' +
+  return '<h3>Paper trading</h3><div style="border:1px solid #262a38;border-radius:24px;padding:18px 20px;background:linear-gradient(180deg,#1b1e2a,#14161f);display:inline-block">' +
     'Balance <b>' + usd(P.balance) + '</b> (start ' + usd(P.start) + ', ' + (P.mode === 'kelly' ? 'quarter-Kelly capped, ' + usd(P.fixedStake, 0) + ' fallback' : 'fixed ' + usd(P.fixedStake, 0)) + ')<br>' +
-    'P/L <b style="color:' + (P.pnl >= 0 ? '#5fd38d' : '#ff6b6b') + '">' + sg(P.pnl) + '</b> · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + ' · win rate ' + pct(P.winRate) + ' (' + P.wins + '-' + P.losses + (P.open ? ', ' + P.open + ' open' : '') + ') · fees ' + usd(P.fees) + '<br>' +
+    'P/L <b style="color:' + (P.pnl >= 0 ? '#34d399' : '#fb7185') + '">' + sg(P.pnl) + '</b> · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + ' · win rate ' + pct(P.winRate) + ' (' + P.wins + '-' + P.losses + (P.open ? ', ' + P.open + ' open' : '') + ') · fees ' + usd(P.fees) + '<br>' +
     'Max drawdown ' + usd(P.maxDrawdown) + ' (' + (P.maxDrawdownPct * 100).toFixed(1) + '%) · best ' + tr(P.best) + ' · worst ' + tr(P.worst) + '<br>' +
     '<span style="color:#7a899f">Simulated buys at the ask at lock time on every TAKE; edits recompute it. <a style="color:#7a899f" href="/api/paper">json</a> · <a style="color:#7a899f" href="/api/export.csv">csv</a></span></div>';
 }
