@@ -413,7 +413,7 @@ function finalize() {
   if (!R.locked || fin == null) return;
   const res = d === 0 ? 'push' : (((d > 0) === (R.locked.side === 'UP')) ? 'won' : 'lost');
   RECENT.unshift({ end: R.end, side: R.locked.side, reason: R.locked.reason, line: R.line, fin, res }); RECENT = RECENT.slice(0, 30);
-  if (CFG.results) push('Result: ' + R.locked.side + ' ' + res.toUpperCase() + (R.locked.decision === 'TAKE' ? '' : ' (no-edge call)'), 'Round ending ' + etTime(R.end) + ' ET. Line ' + usd(R.line) + ', final ' + usd(fin) + ' (' + (d >= 0 ? '+' : '-') + usd(Math.abs(d)) + '). Watcher estimate; Kalshi settles on the CF Benchmarks index and may differ. Use Edit on the page if it is wrong.' + (R.locked.decision === 'TAKE' ? '\n' + paperLine() : ''), 'low', res === 'won' ? 'white_check_mark' : 'x', pageUrl() ? { click: pageUrl() + '/' } : null);
+  if (CFG.results) push('Result: ' + (R.locked.decision === 'TAKE' ? 'LOCK TAKE ' : 'LOCK LEAN ') + R.locked.side + ' ' + res.toUpperCase(), 'Round ending ' + etTime(R.end) + ' ET. Line ' + usd(R.line) + ', final ' + usd(fin) + ' (' + (d >= 0 ? '+' : '-') + usd(Math.abs(d)) + '). Watcher estimate; Kalshi settles on the CF Benchmarks index and may differ. Use Edit on the page if it is wrong.' + (R.locked.decision === 'TAKE' ? '\n' + paperLine() : ''), 'low', res === 'won' ? 'white_check_mark' : 'x', pageUrl() ? { click: pageUrl() + '/' } : null);
 }
 function rollRound(now) { while (now >= R.end) { finalize(); newRound(R.end + ROUND_MS * Math.max(1, Math.floor((now - R.end) / ROUND_MS))); } }
 function applyAutoLine(A, now) {
@@ -448,8 +448,8 @@ function lockLogic(A, now) {
       'Model ' + pct(pr) + (ask != null ? ' vs ask ' + cents(ask) + ' + ' + cents(fee) + ' fee' : ' (no Kalshi price)') + (edge != null ? ' -> edge ' + (edge >= 0 ? '+' : '') + Math.round(edge * 100) + 'c' : '') + '\n' +
       'Checks ' + passN + '/' + total + ' passed. ' + cand.reason + '. ' + mmss(A.left) + ' left.' + (stake ? '\nQuarter-Kelly stake: ' + usd(stake, 0) : '');
     console.log('LOCK', decision, cand.side, body.replace(/\n/g, ' | '));
-    push((decision === 'TAKE' ? 'TAKE ' : 'Lean ') + cand.side + ' - BTC 15m' + (ask != null ? ' @ ' + cents(ask) : ''), body,
-      decision === 'TAKE' ? 'urgent' : 'default', cand.side === 'UP' ? 'chart_with_upwards_trend' : 'chart_with_downwards_trend',
+    push((decision === 'TAKE' ? 'LOCK TAKE ' : 'LOCK LEAN ') + cand.side + ' - BTC 15m' + (ask != null ? ' @ ' + cents(ask) : ''), body,
+      decision === 'TAKE' ? 'urgent' : 'high', cand.side === 'UP' ? 'chart_with_upwards_trend' : 'chart_with_downwards_trend',
       { click: CFG.kalshiUrl, actions: kalshiActions() });
   }
 }
