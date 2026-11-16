@@ -16,7 +16,7 @@
     DATA_DIR        optional. Folder for rounds.json (the server-side scoreboard). Default ./data
                     On Render, point this at a persistent disk mount, e.g. /var/data
     EDIT_KEY        optional. Password for the Edit buttons. Defaults to NTFY_TOPIC.
-    MIN_EDGE        optional. Minimum edge after fee to TAKE, in dollars per $1 contract. Default 0.04
+    MIN_EDGE        optional. Minimum edge after fee to TAKE, in dollars per $1 contract. Default 0.02
     SHRINK          optional. 0..1, how much to trust the model vs the Kalshi price. Default 0.5
     VOL_MULT        optional. Fattens the volatility estimate (BTC has fat tails). Default 1.25
     TILT_WEIGHT     optional. How far flow/trend/etc. can push the z-score. Default 0.3 (was 0.6)
@@ -44,7 +44,7 @@ const CFG = {
   whaleAlerts: process.env.WHALE_ALERTS === '1',
   dataDir: process.env.DATA_DIR || path.join(__dirname, 'data'),
   editKey: process.env.EDIT_KEY || process.env.NTFY_TOPIC || '',
-  minEdge: num(process.env.MIN_EDGE, 0.04),
+  minEdge: num(process.env.MIN_EDGE, 0.02),
   shrink: Math.max(0, Math.min(1, num(process.env.SHRINK, 0.5))),
   volMult: num(process.env.VOL_MULT, 1.25),
   tiltW: num(process.env.TILT_WEIGHT, 0.3),
@@ -364,8 +364,8 @@ function analyze(now) {
   const aligned = side ? sgn * tilt >= 0.1 : false;
   const priceChk = checks.find(c => c.id === 'price'), edge = priceChk && !priceChk.na ? priceChk.edge : null;
   const askSide = side ? (sgn > 0 ? kpYes : kpNo) : null;
-  /* TAKE needs a real Kalshi price now: no price = no way to know there is an edge */
-  const verdict = !side ? 'SKIP' : (counted.length && passN === counted.length && aligned && edge != null ? 'TAKE' : (passN >= counted.length - 1 || strength >= 40 ? 'WAIT' : 'SKIP'));
+  /* TAKE needs a real Kalshi price now: no price = no way to know there is an edge. One check may fail (6 of 7). */
+  const verdict = !side ? 'SKIP' : (counted.length && passN >= counted.length - 1 && aligned && edge != null ? 'TAKE' : (passN >= counted.length - 1 || strength >= 40 ? 'WAIT' : 'SKIP'));
   const stake = (CFG.bankroll > 0 && askSide != null && probSide != null) ? CFG.bankroll * kelly(probSide, askSide / 100 + kalshiFee(askSide / 100)) : null;
   const surgeSgn = w90.net >= 2 * thr ? 1 : (w90.net <= -2 * thr ? -1 : 0);
   let surge = false;
@@ -413,7 +413,7 @@ function finalize() {
   if (!R.locked || fin == null) return;
   const res = d === 0 ? 'push' : (((d > 0) === (R.locked.side === 'UP')) ? 'won' : 'lost');
   RECENT.unshift({ end: R.end, side: R.locked.side, reason: R.locked.reason, line: R.line, fin, res }); RECENT = RECENT.slice(0, 30);
-  if (CFG.results) push('Result: ' + (R.locked.decision === 'TAKE' ? 'LOCK TAKE ' : 'LOCK LEAN ') + R.locked.side + ' ' + res.toUpperCase(), 'Round ending ' + etTime(R.end) + ' ET. Line ' + usd(R.line) + ', final ' + usd(fin) + ' (' + (d >= 0 ? '+' : '-') + usd(Math.abs(d)) + '). Watcher estimate; Kalshi settles on the CF Benchmarks index and may differ. Use Edit on the page if it is wrong.' + (R.locked.decision === 'TAKE' ? '\n' + paperLine() : ''), 'low', res === 'won' ? 'white_check_mark' : 'x', pageUrl() ? { click: pageUrl() + '/' } : null);
+  if (CFG.results) push('Result: ' + (R.locked.decision === 'TAKE' ? 'TAKE ' : 'LEAN ') + R.locked.side + ' ' + res.toUpperCase(), 'Round ending ' + etTime(R.end) + ' ET. Line ' + usd(R.line) + ', final ' + usd(fin) + ' (' + (d >= 0 ? '+' : '-') + usd(Math.abs(d)) + '). Watcher estimate; Kalshi settles on the CF Benchmarks index and may differ. Use Edit on the page if it is wrong.' + (R.locked.decision === 'TAKE' ? '\n' + paperLine() : ''), 'low', res === 'won' ? 'white_check_mark' : 'x', pageUrl() ? { click: pageUrl() + '/' } : null);
 }
 function rollRound(now) { while (now >= R.end) { finalize(); newRound(R.end + ROUND_MS * Math.max(1, Math.floor((now - R.end) / ROUND_MS))); } }
 function applyAutoLine(A, now) {
@@ -448,7 +448,7 @@ function lockLogic(A, now) {
       'Model ' + pct(pr) + (ask != null ? ' vs ask ' + cents(ask) + ' + ' + cents(fee) + ' fee' : ' (no Kalshi price)') + (edge != null ? ' -> edge ' + (edge >= 0 ? '+' : '') + Math.round(edge * 100) + 'c' : '') + '\n' +
       'Checks ' + passN + '/' + total + ' passed. ' + cand.reason + '. ' + mmss(A.left) + ' left.' + (stake ? '\nQuarter-Kelly stake: ' + usd(stake, 0) : '');
     console.log('LOCK', decision, cand.side, body.replace(/\n/g, ' | '));
-    push((decision === 'TAKE' ? 'LOCK TAKE ' : 'LOCK LEAN ') + cand.side + ' - BTC 15m' + (ask != null ? ' @ ' + cents(ask) : ''), body,
+    push((decision === 'TAKE' ? 'TAKE ' : 'LEAN ') + cand.side + ' - BTC 15m' + (ask != null ? ' @ ' + cents(ask) : ''), body,
       decision === 'TAKE' ? 'urgent' : 'high', cand.side === 'UP' ? 'chart_with_upwards_trend' : 'chart_with_downwards_trend',
       { click: CFG.kalshiUrl, actions: kalshiActions() });
   }
@@ -456,7 +456,7 @@ function lockLogic(A, now) {
 function whaleHeadsUp(A, now) {
   if (!CFG.whaleAlerts || R.locked || R.surgeNotified || !A.surge || A.left < 45 || A.left > 720) return;
   R.surgeNotified = true;
-  push('Whale surge ' + (A.surgeSgn > 0 ? 'buying' : 'selling'), usdK(Math.abs(A.w90.net)) + ' net in 90s. Price ' + usd(A.price) + (R.line != null ? ' vs line ' + usd(R.line) : '') + '. Not locked: ' + (A.whaleOk ? 'waiting to hold 4s' : 'line side, exchanges or RSI do not agree') + '.', 'default', 'whale');
+  push('Whale surge ' + (A.surgeSgn > 0 ? 'buying' : 'selling'), usdK(Math.abs(A.w90.net)) + ' net in 90s. Price ' + usd(A.price) + (R.line != null ? ' vs line ' + usd(R.line) : '') + '. No call yet: ' + (A.whaleOk ? 'waiting to hold 4s' : 'line side, exchanges or RSI do not agree') + '.', 'default', 'whale');
 }
 /* snapshot at 4 min left: this is what calibration is measured on, for every round */
 function leanLogic(A, now) {
@@ -484,7 +484,7 @@ function feedWatch(now) {
 }
 function heartbeat() {
   const now = Date.now(), st = stats(), live = liveFeeds(now).length;
-  push('Line Lock alive', 'Up ' + Math.round((now - BOOT) / 3600000) + 'h. ' + live + '/' + Object.keys(FEEDS).length + ' feeds live. Price ' + usd(STATUS.price) + '. Locked record ' + st.all.w + '-' + st.all.l + ', TAKE ' + st.take.w + '-' + st.take.l + ' (' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + '/contract). ' + ROUNDS.length + ' rounds logged. ' + paperLine() + '.', 'min', 'heartbeat');
+  push('Line Lock alive', 'Up ' + Math.round((now - BOOT) / 3600000) + 'h. ' + live + '/' + Object.keys(FEEDS).length + ' feeds live. Price ' + usd(STATUS.price) + '. All calls ' + st.all.w + '-' + st.all.l + ', TAKE ' + st.take.w + '-' + st.take.l + ' (' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + '/contract). ' + ROUNDS.length + ' rounds logged. ' + paperLine() + '.', 'min', 'heartbeat');
 }
 
 /* ---------- Kalshi settlement check: replace our estimate with the official result ---------- */
@@ -607,8 +607,8 @@ function page() {
   const calRows = st.cal.map(b => '<tr><td>' + b.range + '</td><td>' + b.n + '</td><td>' + pct(b.avgP) + '</td><td>' + pct(b.actual) + '</td><td>' + (b.n >= 20 && b.actual != null ? (b.actual < b.avgP - 0.05 ? '<span style="color:#fb7185">overconfident</span>' : b.actual > b.avgP + 0.05 ? 'underconfident' : '<span style="color:#34d399">ok</span>') : 'need 20+') + '</td></tr>').join('');
   const P = paper();
   const leanPct = s.prob == null ? 0 : Math.min(100, Math.max(0, s.prob));
-  const heroTitle = s.locked ? 'LOCKED ' + esc(s.locked.side) + ' (' + esc(s.locked.decision) + ')' : 'Watching';
-  const heroReason = s.locked ? esc(s.locked.reason) : 'Waiting for the next lock';
+  const heroTitle = s.locked ? esc(s.locked.decision) + ': ' + esc(s.locked.side) : 'Watching';
+  const heroReason = s.locked ? esc(s.locked.reason) : 'Waiting for the next call';
   return '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Line Lock watcher</title>' +
     '<style>body{max-width:720px;margin:0 auto}h2{font-size:30px;letter-spacing:-.03em;font-weight:800}h3{font-size:19px;margin:32px 4px 12px;color:#cbd2e1}.card{background:linear-gradient(180deg,#1b1e2a,#14161f);border:1px solid #262a38;border-radius:24px;padding:18px 20px;margin:14px 0;box-shadow:0 8px 24px rgba(0,0,0,.28);overflow-wrap:anywhere}.hero{border:1px solid transparent;background:linear-gradient(#171924,#171924) padding-box,linear-gradient(135deg,#7c5cff,#00c2ff,#34d399) border-box}.big{font-size:42px;font-weight:800;letter-spacing:-.03em;line-height:1.1}.muted{color:#9aa3b2;font-size:14px}.pill{display:inline-block;padding:5px 12px;border-radius:999px;font-weight:700;font-size:14px;background:rgba(52,211,153,.15);color:#34d399}.pill-tape{background:rgba(124,92,255,.18);color:#c4b5fd}.bar{height:10px;border-radius:999px;background:#262a38;overflow:hidden;margin:10px 0}.bar>div{height:100%;background:linear-gradient(90deg,#7c5cff,#00c2ff)}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.grid .card{margin:0}table{border-collapse:collapse;width:100%;background:#14161f;border:1px solid #262a38;border-radius:20px;overflow:hidden;display:block;overflow-x:auto}td,th{padding:12px 14px;border-bottom:1px solid #222634;text-align:left;white-space:nowrap}th{font-size:13px;color:#9aa3b2;font-weight:600}button{background:linear-gradient(135deg,#7c5cff,#00c2ff);color:#fff;border:0;border-radius:999px;padding:10px 18px;font-weight:700;cursor:pointer;min-height:42px}select,input{background:#1b1e2a;color:#eef1f6;border:1px solid #2c3245;border-radius:14px;padding:11px 14px;min-height:42px}a{color:#7dd3fc;text-decoration:none}#edbox{display:none;position:fixed;top:18%;left:50%;transform:translateX(-50%);background:#1b1e2a;border:1px solid #2c3245;padding:20px;border-radius:20px;box-shadow:0 12px 32px rgba(0,0,0,.4);width:min(92vw,380px);z-index:10}details summary{cursor:pointer;color:#cbd2e1}@media(max-width:560px){.grid{grid-template-columns:1fr 1fr}.big{font-size:34px}}</style>' +
     '<body style="font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0d12;color:#eef1f6;padding:16px"><h2>Line Lock</h2><p class="muted" style="margin-top:-8px">BTC 15-minute watcher · Live</p>' +
@@ -619,7 +619,7 @@ function page() {
     '<div class="bar"><div style="width:' + leanPct + '%"></div></div>' +
     '<div class="muted">' + (s.feeds || 0) + ' feeds live · RSI 1m ' + (s.rsi1 == null ? '--' : s.rsi1) + ' · whale net 5m ' + (s.whaleNet5m == null ? '--' : usdK(s.whaleNet5m)) + (s.surge ? ' · SURGE' : '') + '</div>' +
     '<div style="margin-top:8px">' + feeds + '</div></div>' +
-    '<div class="grid"><div class="card"><div class="muted">All locks</div><div style="font-size:26px;font-weight:800">' + wr(st.all.w, st.all.l) + '</div><div class="muted">' + st.all.w + '-' + st.all.l + '</div></div><div class="card"><div class="muted">TAKE only</div><div style="font-size:26px;font-weight:800">' + wr(st.take.w, st.take.l) + '</div><div class="muted">' + st.take.w + '-' + st.take.l + ' · ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' / contract</div></div><div class="card"><div class="muted">Paper balance</div><div style="font-size:26px;font-weight:800">' + usd(P.balance) + '</div><div class="muted">' + (P.pnl >= 0 ? '+' : '-') + usd(Math.abs(P.pnl)) + ' · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + '</div></div></div>' +
+    '<div class="grid"><div class="card"><div class="muted">All calls</div><div style="font-size:26px;font-weight:800">' + wr(st.all.w, st.all.l) + '</div><div class="muted">' + st.all.w + '-' + st.all.l + '</div></div><div class="card"><div class="muted">TAKE only</div><div style="font-size:26px;font-weight:800">' + wr(st.take.w, st.take.l) + '</div><div class="muted">' + st.take.w + '-' + st.take.l + ' · ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' / contract</div></div><div class="card"><div class="muted">Paper balance</div><div style="font-size:26px;font-weight:800">' + usd(P.balance) + '</div><div class="muted">' + (P.pnl >= 0 ? '+' : '-') + usd(Math.abs(P.pnl)) + ' · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + '</div></div></div>' +
     '<div class="card"><h3 style="margin:0 0 8px">Checks</h3><ul style="margin:8px 0;padding-left:20px">' + rows + '</ul></div>' +
     '<h3>Recent rounds</h3><table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
     paperCard() +
@@ -640,7 +640,7 @@ function paperCard() {
     'Balance <b>' + usd(P.balance) + '</b> (start ' + usd(P.start) + ', ' + (P.mode === 'kelly' ? 'quarter-Kelly capped, ' + usd(P.fixedStake, 0) + ' fallback' : 'fixed ' + usd(P.fixedStake, 0)) + ')<br>' +
     'P/L <b style="color:' + (P.pnl >= 0 ? '#34d399' : '#fb7185') + '">' + sg(P.pnl) + '</b> · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + ' · win rate ' + pct(P.winRate) + ' (' + P.wins + '-' + P.losses + (P.open ? ', ' + P.open + ' open' : '') + ') · fees ' + usd(P.fees) + '<br>' +
     'Max drawdown ' + usd(P.maxDrawdown) + ' (' + (P.maxDrawdownPct * 100).toFixed(1) + '%) · best ' + tr(P.best) + ' · worst ' + tr(P.worst) + '<br>' +
-    '<span style="color:#7a899f">Simulated buys at the ask at lock time on every TAKE; edits recompute it. <a style="color:#7a899f" href="/api/paper">json</a> · <a style="color:#7a899f" href="/api/export.csv">csv</a></span></div>';
+    '<span style="color:#7a899f">Simulated buys at the ask when the call is made, on every TAKE; edits recompute it. <a style="color:#7a899f" href="/api/paper">json</a> · <a style="color:#7a899f" href="/api/export.csv">csv</a></span></div>';
 }
 function readBody(req) { return new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 10000) { no(new Error('too big')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); }); }
 function startServer() {
