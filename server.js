@@ -7,7 +7,9 @@
   a macro-event calendar, MACD + reversion readouts, and the Polymarket US
   15m BTC price next to Kalshi's), plus display-only readouts (odds trail,
   taker flow, call grade, distance to line, market gauge, FVG and
-  supply/demand zones) and a BTC chart with zones drawn on it.
+  supply/demand zones, liquidity map, order blocks, session timing and a
+  risk line), multi-timeframe confirmation with lock-in alerts, and a BTC
+  chart with zones drawn on it and zoom buttons.
   Display only; never used for calls.
 
   Environment variables
@@ -500,6 +502,303 @@ function computeZoneState(cs, price) {
   }
   return { supply: sup, demand: dem, openCount: open.length, open: open.map(z => ({ dir: z.dir, low: Math.round(z.low * 100) / 100, high: Math.round(z.high * 100) / 100, startIdx: z.origin })) };
 }
+/* ---------- display-only Bucko-menu features: liquidity map, order blocks,
+   session timing, risk line ----------
+   Pure helpers, consumed ONLY by the STATUS literal in tick() and by page()
+   rendering. Nothing in analyze(), checksFor(), lockLogic, paper, stats, CSV,
+   or sizing reads these values. */
+/* ATR(14): mean of the last 14 true ranges on 1-minute candles — the same
+   volatility yardstick computeZoneState() uses inline for its impulse
+   threshold (recomputed here so the zone code stays untouched). Null below
+   15 candles: 14 ranges need 15 closes. */
+function atr14(cs) {
+  if (!cs || cs.length < 15) return null;
+  let sum = 0;
+  for (let i = cs.length - 14; i < cs.length; i++) {
+    const c = cs[i], p = cs[i - 1];
+    sum += Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c));
+  }
+  return sum / 14;
+}
+/* Liquidity map: ONE fixed rule. A swing high is a 1-minute candle whose high
+   exceeds the highs of the 3 candles on each side; a swing low is the mirror
+   image. Swing levels within 0.05% of each other cluster into one pool:
+   levels are scanned low to high and each joins the current pool when it is
+   within 0.05% of the pool's running mean, so the pool level is the mean of
+   its member levels. Only the nearest swing-high pool strictly above the
+   price and the nearest swing-low pool strictly below it are reported —
+   pools are where stop orders cluster, i.e. price magnets.
+   Display only; evaluated every tick alongside FVG/zones. */
+function computeLiquidityMap(cs, price) {
+  const empty = { above: null, below: null, poolCount: 0 };
+  if (!cs || cs.length < 7) return empty;
+  const px = (price != null && isFinite(price)) ? price : cs[cs.length - 1].c;
+  const highs = [], lows = [];
+  for (let i = 3; i < cs.length - 3; i++) {
+    const c = cs[i];
+    if (c.h > cs[i - 3].h && c.h > cs[i - 2].h && c.h > cs[i - 1].h && c.h > cs[i + 1].h && c.h > cs[i + 2].h && c.h > cs[i + 3].h) highs.push(c.h);
+    if (c.l < cs[i - 3].l && c.l < cs[i - 2].l && c.l < cs[i - 1].l && c.l < cs[i + 1].l && c.l < cs[i + 2].l && c.l < cs[i + 3].l) lows.push(c.l);
+  }
+  const cluster = levels => {
+    const pools = [];
+    for (const lv of levels.slice().sort((a, b) => a - b)) {
+      const last = pools[pools.length - 1];
+      if (last && Math.abs(lv - last.level) / last.level <= 0.0005) {
+        last.level = (last.level * last.count + lv) / (last.count + 1);
+        last.count++;
+      } else pools.push({ level: lv, count: 1 });
+    }
+    return pools;
+  };
+  const hiPools = cluster(highs), loPools = cluster(lows);
+  const r2 = v => Math.round(v * 100) / 100;
+  let above = null, below = null;
+  for (const p of hiPools) if (p.level > px && (!above || p.level < above.level)) above = p;
+  for (const p of loPools) if (p.level < px && (!below || p.level > below.level)) below = p;
+  return {
+    above: above ? { level: r2(above.level), count: above.count } : null,
+    below: below ? { level: r2(below.level), count: below.count } : null,
+    poolCount: hiPools.length + loPools.length
+  };
+}
+/* Order blocks: ONE fixed rule. An impulse is a 1–3 candle move whose net
+   close-to-close change from the candle before it clears 1.5 x ATR(14) — the
+   same impulse definition computeZoneState() uses, so blocks and zones agree
+   on what counts as a push. The impulse's first candle must push in the
+   impulse's direction, so a counter-move candle immediately before the push
+   is not absorbed into the impulse window — it is the block candidate, not
+   part of the impulse. The order block is the nearest opposite-direction
+   candle within the 3 candles immediately before the impulse (the last red
+   candle before an up impulse, the last green candle before a down impulse);
+   if none of those 3 candles is opposite-direction, the impulse forms no
+   block. The block zone is that candle's [low, high]. The first qualifying
+   impulse length wins, and the scan resumes after the impulse, so blocks
+   never overlap. A block is invalidated once a later candle CLOSES through
+   its far edge (bullish block: close below the block low; bearish block:
+   close above the block high — wicks do not invalidate). Only the nearest
+   untested bullish block below the price and bearish block above it are
+   reported. Display only: row + STATUS, never drawn on the chart. */
+function computeOrderBlocks(cs, price) {
+  const empty = { bullish: null, bearish: null, openCount: 0 };
+  const atr = atr14(cs);
+  if (atr == null || atr <= 0) return empty;
+  const n = cs.length, impulseMin = 1.5 * atr, blocks = [];
+  let i = 1;
+  while (i < n) {
+    let formed = null, consumedTo = -1;
+    for (let m = 1; m <= 3; m++) {
+      const e = i + m - 1;
+      if (e >= n) break;
+      const move = cs[e].c - cs[i - 1].c;
+      if (Math.abs(move) < impulseMin) continue;
+      const first = cs[i].c - cs[i - 1].c;
+      if (first === 0 || (first > 0) !== (move > 0)) continue; /* impulse must start with a push its own way */
+      const dir = move > 0 ? 1 : -1;
+      consumedTo = e;
+      for (let b = i - 1; b >= Math.max(0, i - 3); b--) {
+        const opp = dir > 0 ? cs[b].c < cs[b].o : cs[b].c > cs[b].o;
+        if (opp) { formed = { dir, low: cs[b].l, high: cs[b].h, formedAt: e, origin: b }; break; }
+      }
+      break; /* first qualifying impulse length wins */
+    }
+    if (formed) blocks.push(formed);
+    i = consumedTo >= 0 ? consumedTo + 1 : i + 1;
+  }
+  const open = blocks.filter(z => {
+    for (let j = z.formedAt + 1; j < n; j++) {
+      if ((z.dir > 0 && cs[j].c < z.low) || (z.dir < 0 && cs[j].c > z.high)) return false;
+    }
+    return true;
+  });
+  const px = (price != null && isFinite(price)) ? price : cs[n - 1].c;
+  const last = n - 1;
+  let bull = null, bear = null;
+  for (const z of open) {
+    const zone = { low: Math.round(z.low * 100) / 100, high: Math.round(z.high * 100) / 100, ageCandles: last - z.formedAt };
+    if (z.dir > 0 && z.high <= px && (!bull || zone.high > bull.high)) bull = zone;
+    if (z.dir < 0 && z.low >= px && (!bear || zone.low < bear.low)) bear = zone;
+  }
+  return { bullish: bull, bearish: bear, openCount: open.length };
+}
+/* Session timing: pure ET wall-clock math on the server clock. Session
+   boundaries: Asia 19:00–04:00 ET, London 03:00–11:30 ET, New York 09:30–16:00
+   ET. Overlaps resolve to the later-opening session: 03:00–04:00 is London
+   (opened later than Asia), 09:30–11:30 is New York (opened later than
+   London). 16:00–19:00 ET no session is open. The next-open countdown looks
+   at today plus the next two ET dates through etWallToMs, so DST transitions
+   are handled per date. The next macro event is already shown by
+   contextLine(), so this row carries sessions only. Display only. */
+function computeSession(now) {
+  const p = etParts.formatToParts(now), g = t => +p.find(x => x.type === t).value;
+  const mins = (g('hour') % 24) * 60 + g('minute');
+  const inWin = (a, b) => a <= b ? (mins >= a && mins < b) : (mins >= a || mins < b);
+  let current;
+  if (inWin(570, 960)) current = 'New York';
+  else if (inWin(180, 690)) current = 'London';
+  else if (inWin(1140, 240)) current = 'Asia';
+  else current = 'Between sessions';
+  const opens = [{ name: 'Asia', h: 19, m: 0 }, { name: 'London', h: 3, m: 0 }, { name: 'New York', h: 9, m: 30 }];
+  let best = null;
+  for (let d = 0; d < 3; d++) {
+    const key = etDateKey(now + d * 86400000);
+    for (const o of opens) {
+      const at = etWallToMs(key, o.h, o.m);
+      if (at > now && (!best || at < best.at)) best = { name: o.name, at };
+    }
+  }
+  return { current, next: best ? best.name : null, minsUntilNext: best ? Math.round((best.at - now) / 60000) : null, opensAtISO: best ? new Date(best.at).toISOString() : null };
+}
+/* Risk line: required velocity vs normal pace. required = |distance to line|
+   / minutes left in the window ($/min); feasibility compares it against the
+   recent typical 1-minute move, ATR(14). Null-safe: no distance, no ATR, or
+   no time left all return null — never divide by zero. Display only. */
+function computeRiskLine(dtl, leftSec, cs) {
+  if (!dtl || leftSec == null || !isFinite(leftSec) || leftSec <= 0) return null;
+  const atr = atr14(cs);
+  if (atr == null || atr <= 0) return null;
+  const minsLeft = leftSec / 60;
+  const need = Math.abs(dtl.usd);
+  const perMin = need / minsLeft;
+  const r2 = v => Math.round(v * 100) / 100;
+  return { needUsd: r2(need), minsLeft: r2(minsLeft), perMin: r2(perMin), atr: r2(atr), ratio: r2(perMin / atr) };
+}
+/* ---------- display-only multi-timeframe confirmation ----------
+   Seven timeframes — 10s, 15s, 30s, 1m, 5m, 10m, 15m — each independently
+   "locks in" UP or DOWN when its own trend, momentum, and price-vs-average
+   ALL agree. Nothing here feeds analyze(), checksFor(), lockLogic, paper,
+   stats, CSV, or the lock hook: the states render on the page and fire a
+   one-shot alert on lock-in, and that is all.
+   LOCK-IN RULE (identical for every timeframe, computed from that
+   timeframe's own candles only):
+     UP   when EMA9 > EMA21 AND RSI(14) > 50 AND last close > VWAP
+     DOWN when EMA9 < EMA21 AND RSI(14) < 50 AND last close < VWAP
+     otherwise not locked in (no direction).
+   VWAP is the rolling 60-candle volume-weighted average of typical price
+   ((h+l+c)/3), the same definition indArrays() uses; tfVwapLast() computes
+   it for the last candle only. EMA/RSI reuse the existing emaSeries() and
+   rsiSeries(), which already accept arbitrary close arrays.
+   CANDLE SOURCES (no new feeds): 1m uses the closed 1-minute candles;
+   5m/10m/15m aggregate them (same merge analyze() uses for its 5-min RSI);
+   10s/15s/30s bucket the per-second price ticks tick() already receives
+   (recordTfTick, called from tick() only). Sub-minute buckets are stateful
+   on purpose: deriving them from S.hist would starve the 30s frame, because
+   S.hist is pruned to 20 minutes (40 buckets) against the 35-bucket minimum.
+   WARM-UP: a timeframe needs TF_MIN_CANDLES closes before it can lock in.
+   Below that it reports warmingUp and can never lock in — after a restart
+   the sub-minute frames fill in over minutes, which is expected. */
+/* Minimum closes for a lock-in: 21 (a full EMA21 period) + 14 (the RSI(14)
+   lookback). RSI(14) needs 15 closes for its first value; 35 gives both
+   indicators room to settle, and matches the 35-candle threshold
+   computeDisplayIndicators() already uses. */
+const TF_MIN_CANDLES = 35;
+const TF_ORDER = ['10s', '15s', '30s', '1m', '5m', '10m', '15m'];
+const TF_SUB_MS = { '10s': 10000, '15s': 15000, '30s': 30000 };
+const TF_SUB_MAX = 240; /* buckets kept per sub-minute frame: 40 min of 10s, 60 min of 15s, 120 min of 30s */
+/* Sub-minute bucket state: arrays of forming candles {t,o,h,l,c,v} where v is
+   the tick count in the bucket (the VWAP weight). The current bucket stays
+   open and updates every tick; it counts like any other candle. */
+const tfSubBuckets = { '10s': [], '15s': [], '30s': [] };
+/* Last alerted lock-in direction per timeframe, plus the priming flag.
+   tfFireAlerts() records the states it finds on its first run WITHOUT
+   firing: a frame already locked in before a restart is not a new lock-in. */
+const tfAlerted = {};
+function tfAggregateCandles(cs, bucketMs) {
+  const g = new Map();
+  for (const c of cs) {
+    const k = Math.floor(c.t / bucketMs) * bucketMs, b = g.get(k);
+    if (!b) g.set(k, { t: k, o: c.o, h: c.h, l: c.l, c: c.c, v: c.v });
+    else { b.h = Math.max(b.h, c.h); b.l = Math.min(b.l, c.l); b.c = c.c; b.v += c.v; }
+  }
+  return Array.from(g.values());
+}
+function tfVwapLast(cs, window) {
+  const w = window || 60, n = cs ? cs.length : 0;
+  if (!n) return null;
+  let pv = 0, vv = 0;
+  for (let i = Math.max(0, n - w); i < n; i++) { const tp = (cs[i].h + cs[i].l + cs[i].c) / 3; pv += tp * cs[i].v; vv += cs[i].v; }
+  return vv > 0 ? pv / vv : null;
+}
+function tfStateFor(cs) {
+  const n = cs ? cs.length : 0;
+  const base = { warmingUp: true, locked: false, dir: null, n, ema9: null, ema21: null, rsi: null, vwap: null, close: null };
+  if (n < TF_MIN_CANDLES) return base;
+  const closes = cs.map(c => c.c), last = n - 1;
+  const ema9 = emaSeries(closes, 9)[last], ema21 = emaSeries(closes, 21)[last], rsi = rsiSeries(closes, 14)[last];
+  const vwap = tfVwapLast(cs, 60), close = closes[last];
+  if (ema9 == null || ema21 == null || rsi == null || vwap == null) return base;
+  /* The lock decision uses the raw values; the rounded copies below are display only. */
+  const up = ema9 > ema21 && rsi > 50 && close > vwap;
+  const down = ema9 < ema21 && rsi < 50 && close < vwap;
+  return { warmingUp: false, locked: up || down, dir: up ? 'UP' : down ? 'DOWN' : null, n, ema9: +ema9.toFixed(2), ema21: +ema21.toFixed(2), rsi: +rsi.toFixed(1), vwap: +vwap.toFixed(2), close };
+}
+function computeTfConfirm(ccs, subBuckets) {
+  const frames = {
+    '10s': tfStateFor(subBuckets && subBuckets['10s']),
+    '15s': tfStateFor(subBuckets && subBuckets['15s']),
+    '30s': tfStateFor(subBuckets && subBuckets['30s']),
+    '1m': tfStateFor(ccs),
+    '5m': tfStateFor(tfAggregateCandles(ccs || [], 300000)),
+    '10m': tfStateFor(tfAggregateCandles(ccs || [], 600000)),
+    '15m': tfStateFor(tfAggregateCandles(ccs || [], 900000))
+  };
+  let up = 0, down = 0, warming = 0;
+  for (const name of TF_ORDER) { const f = frames[name]; if (f.warmingUp) warming++; else if (f.locked && f.dir === 'UP') up++; else if (f.locked && f.dir === 'DOWN') down++; }
+  const summary = up > 0 && down === 0 ? up + ' of ' + TF_ORDER.length + ' locked in UP'
+    : down > 0 && up === 0 ? down + ' of ' + TF_ORDER.length + ' locked in DOWN'
+    : up > 0 && down > 0 ? 'Mixed · ' + up + ' UP / ' + down + ' DOWN'
+    : 'None locked in';
+  return { frames, order: TF_ORDER.slice(), up, down, warming, summary };
+}
+function recordTfTick(now, price, store) {
+  if (price == null || !isFinite(price)) return;
+  const buckets = store || tfSubBuckets;
+  for (const name of Object.keys(TF_SUB_MS)) {
+    const arr = buckets[name];
+    if (!arr) continue;
+    const k = Math.floor(now / TF_SUB_MS[name]) * TF_SUB_MS[name], lastB = arr[arr.length - 1];
+    if (lastB && lastB.t === k) { lastB.h = Math.max(lastB.h, price); lastB.l = Math.min(lastB.l, price); lastB.c = price; lastB.v++; }
+    else if (!lastB || k > lastB.t) { arr.push({ t: k, o: price, h: price, l: price, c: price, v: 1 }); while (arr.length > TF_SUB_MAX) arr.shift(); }
+    /* k < lastB.t means the clock went backward: ignore the tick, keep order. */
+  }
+}
+/* One-shot lock-in alerts, through push() only. Fires once per timeframe per
+   direction when a frame newly locks in; a frame that stays locked in does
+   not re-alert; unlocking resets it so a fresh lock-in alerts again. The
+   first run only primes the state (see tfAlerted) and fires nothing, and the
+   first 120s after boot prime silently too (see QUIET_BOOT_MS).
+   `alerted`/`notify`/`now` are injectable for tests; production uses the module
+   state, push(), and Date.now(). Returns the titles fired. Display path only. */
+/* Quiet boot: the first 120 seconds after process start prime timeframe
+   states silently and fire nothing. A cold boot is not a transition: frames
+   resolve from warm-up as candles load, and without this guard each one
+   alerts once within the first minute of a restart (observed for 1m/5m/10m/
+   15m). BOOT is the process-start timestamp captured at module load; the
+   `now` parameter exists so tests can step past the window. Call alerts are
+   untouched — this guard lives only in tfFireAlerts. */
+const QUIET_BOOT_MS = 120000;
+function tfFireAlerts(tfc, price, alerted, notify, now) {
+  const fired = [];
+  if (!tfc) return fired;
+  const seen = alerted || tfAlerted, send = notify || push;
+  const quietBoot = (now != null ? now : Date.now()) - BOOT < QUIET_BOOT_MS;
+  const priming = !seen.__primed || quietBoot;
+  for (const name of tfc.order) {
+    const f = tfc.frames[name];
+    if (!f) continue;
+    if (f.locked && f.dir) {
+      if (!priming && seen[name] !== f.dir) {
+        const title = name + ' chart locked in ' + f.dir;
+        send(title, 'EMA9 vs EMA21, RSI(14), and price vs VWAP all agree on the ' + name + ' chart.' + (price != null ? ' Price ' + usd(price) + '.' : '') + ' ' + tfc.up + ' timeframe(s) locked UP, ' + tfc.down + ' locked DOWN.', 'default', 'chart');
+        fired.push(title);
+      }
+      seen[name] = f.dir;
+    } else {
+      seen[name] = null;
+    }
+  }
+  seen.__primed = true;
+  return fired;
+}
 const red = k => k.c < k.o, grn = k => k.c > k.o;
 const PATS = [
   { id: 'bearEng', name: 'Bearish engulfing', dir: -1, test: (c, i) => { const a = c[i - 1], b = c[i]; return grn(a) && red(b) && b.o >= a.c && b.c <= a.o; } },
@@ -808,6 +1107,12 @@ function tick() {
   const gr = gradeFor(A.passN, A.total); // display only: derived from the checks analyze() already counted
   const dtl = distToLine(A.price, R.line); // display only
   const gg = marketGauge(A.mktUp); // display only
+  const lq = computeLiquidityMap(ccs, A.price); // display only
+  const ob = computeOrderBlocks(ccs, A.price); // display only
+  const sn = computeSession(now); // display only
+  const rk = computeRiskLine(dtl, A.left, ccs); // display only
+  recordTfTick(now, A.price); // display only: sub-minute buckets for timeframe confirmation
+  const tfc = computeTfConfirm(ccs, tfSubBuckets); // display only: never feeds analyze/lock/paper
   STATUS = {
     time: new Date(now).toISOString(), left: mmss(A.left), feeds: A.live.length, feedHealth: fh, price: A.price, line: R.line, lineFrom: R.lineFrom,
     side: A.side, strength: A.strength, prob: A.probSide == null ? null : Math.round(A.probSide * 100),
@@ -819,9 +1124,11 @@ function tick() {
     okx: (S.okx && now - S.okx.t < 120000) ? { fundingRate: S.okx.fundingRate, oiUsd: S.okx.oiUsd, t: S.okx.t } : null,
     events: { today: eventsToday(now), next: nextEvent(now) },
     macd: di.macd, reversion: di.reversion,
-    oddsTrail: ot, takerFlow: tf, grade: gr, distToLine: dtl, gauge: gg, fvg: fv, zones: zn,
+    oddsTrail: ot, takerFlow: tf, grade: gr, distToLine: dtl, gauge: gg, fvg: fv, zones: zn, tfConfirm: tfc,
+    liquidity: lq, orderBlocks: ob, session: sn, risk: rk,
     kalshi: A.K ? { ticker: A.K.ticker, yesAsk: A.K.yesAsk, noAsk: A.K.noAsk } : null, polyUs: (S.polyUs && S.polyUs.t && now - S.polyUs.t < 60000 && S.polyUs.ask != null) ? { ask: S.polyUs.ask, bid: S.polyUs.bid, slug: S.polyUs.slug } : null, diag: S.diag, topicSet: !!CFG.topic, roundsLogged: ROUNDS.length
   };
+  tfFireAlerts(tfc, A.price); // display only: one-shot lock-in alerts, deduped; never affects decisions
   return A;
 }
 
@@ -967,6 +1274,16 @@ function calendarHtml(now, daily) {
    baseIndex = index of candles[0] in that full array, line = Kalshi line,
    price = current price. Zone rects run from the origin candle to the right
    edge; rects are capped at the 8 nearest to price. */
+/* Chart zoom viewBox math, shared by the page script and the tests: the
+   function source is embedded in the page (zoomViewBox.toString()), so the
+   shipped client code IS the tested code. Zoom anchors bottom-right, so the
+   latest candles stay in view. Levels: 1x, 1.5x, 2x, 3x, 4x. */
+function zoomViewBox(level) {
+  const W = 680, H = 260, L = (level > 0 && isFinite(level)) ? level : 1;
+  const r = v => Math.round(v * 100) / 100;
+  const w = W / L, h = H / L;
+  return r(W - w) + ' ' + r(H - h) + ' ' + r(w) + ' ' + r(h);
+}
 function chartSvg(candles, opts) {
   const o = opts || {};
   const cs = (candles || []).filter(c => c && isFinite(c.o) && isFinite(c.h) && isFinite(c.l) && isFinite(c.c) && isFinite(c.t));
@@ -986,7 +1303,7 @@ function chartSvg(candles, opts) {
   const n = cs.length, slot = PW / n, bw = Math.max(2, slot * 0.6);
   const cx = i => L + i * slot + slot / 2;
   const parts = [];
-  parts.push('<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" role="img" aria-label="BTC 1-minute chart" style="display:block;background:#14161f;border-radius:16px">');
+  parts.push('<svg id="llchart" viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" role="img" aria-label="BTC 1-minute chart" style="display:block;background:#14161f;border-radius:16px">');
   /* gridlines + price labels */
   for (let k = 0; k < 4; k++) {
     const p = lo + range * (k / 3), gy = r1(y(p));
@@ -1095,6 +1412,47 @@ function zonesTxt(s) {
   const w = x => x ? usd(x.low, 0) + '–' + usd(x.high, 0) : '--';
   return 'Supply ' + w(zn.supply) + ' · Demand ' + w(zn.demand);
 }
+function sessionTxt(s) {
+  const sn = s.session;
+  if (!sn) return '--';
+  const dur = sn.minsUntilNext == null ? '--' : sn.minsUntilNext < 60 ? sn.minsUntilNext + 'm' : Math.floor(sn.minsUntilNext / 60) + 'h ' + String(sn.minsUntilNext % 60).padStart(2, '0') + 'm';
+  return sn.current + ' · Next: ' + (sn.next || '--') + ' opens in ' + dur;
+}
+function riskTxt(s) {
+  const r = s.risk;
+  if (!r) return '--';
+  const mins = r.minsLeft % 1 === 0 ? String(r.minsLeft) : r.minsLeft.toFixed(1);
+  return 'needs ' + usd(r.needUsd) + ' in ' + mins + ' min (' + usd(r.perMin) + '/min, ' + r.ratio + 'x normal pace)';
+}
+function liquidityTxt(s) {
+  const lq = s.liquidity;
+  if (!lq) return '--';
+  const a = lq.above ? usd(lq.above.level, 0) + ' (' + lq.above.count + ' highs)' : '--';
+  const b = lq.below ? usd(lq.below.level, 0) + ' (' + lq.below.count + ' lows)' : '--';
+  return 'Above: ' + a + ' · Below: ' + b;
+}
+function orderBlocksTxt(s) {
+  const ob = s.orderBlocks;
+  if (!ob) return '--';
+  const w = x => x ? usd(x.low, 0) + '–' + usd(x.high, 0) : '--';
+  return 'Bullish below ' + w(ob.bullish) + ' · Bearish above ' + w(ob.bearish);
+}
+/* Timeframe confirmation card: one row per timeframe plus a summary row.
+   Renders from STATUS.tfConfirm only. Display only. */
+function tfConfirmCard(s) {
+  const t = s.tfConfirm;
+  let inner;
+  if (!t) inner = '<div class="muted">--</div>';
+  else {
+    inner = t.order.map(name => {
+      const f = t.frames[name];
+      const val = !f ? '--' : f.warmingUp ? 'warming up' : f.locked ? f.dir + ' · locked in' : '—';
+      const col = f && f.locked ? (f.dir === 'UP' ? '#34d399' : '#fb7185') : '#eef1f6';
+      return '<div class="ctxrow"><span class="clabel">' + esc(name) + '</span><span class="cval" style="color:' + col + '">' + esc(val) + '</span></div>';
+    }).join('') + '<div class="ctxrow"><span class="clabel">Summary</span><span class="cval">' + esc(t.summary) + '</span></div>';
+  }
+  return '<div class="card"><h3 style="margin:0 0 8px">Timeframe confirmation</h3>' + inner + '</div>';
+}
 function page() {
   const s = STATUS, rows = (s.checks || []).map(c => '<li>' + esc(c) + '</li>').join('');
   const st = stats();
@@ -1148,12 +1506,16 @@ function page() {
     '<div class="ctxrow"><span class="clabel">Open interest (OKX)</span><span class="cval">' + esc(oiTxt) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">MACD 12/26/9</span><span class="cval">' + esc(macdTxt) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">Reversion</span><span class="cval">' + esc(revTxt) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Session</span><span class="cval">' + esc(sessionTxt(s)) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Risk</span><span class="cval">' + esc(riskTxt(s)) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">Events</span><span class="cval">' + esc(evTxt) + '</span></div></div>';
   const flowCard = '<div class="card"><h3 style="margin:0 0 4px">Flow &amp; levels</h3>' +
     '<div class="ctxrow"><span class="clabel">Taker flow</span><span class="cval">' + esc(flowTxt(s)) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">Fair value gaps</span><span class="cval">' + esc(fvgTxt(s)) + '</span></div>' +
-    '<div class="ctxrow"><span class="clabel">Supply / demand zones</span><span class="cval">' + esc(zonesTxt(s)) + '</span></div></div>';
-  const chartHtml = '<div class="card"><h3 style="margin:0 0 8px">BTC · 1-minute</h3>' + chartCard(s) + '</div>';
+    '<div class="ctxrow"><span class="clabel">Supply / demand zones</span><span class="cval">' + esc(zonesTxt(s)) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Liquidity map</span><span class="cval">' + esc(liquidityTxt(s)) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Order blocks</span><span class="cval">' + esc(orderBlocksTxt(s)) + '</span></div></div>';
+  const chartHtml = '<div class="card"><h3 style="margin:0 0 8px">BTC · 1-minute<span style="float:right;font-size:14px;font-weight:400"><button type="button" onclick="llZoomStep(-1)" style="padding:4px 12px;min-height:0">-</button> <span id="llzoomlbl" class="muted">1x</span> <button type="button" onclick="llZoomStep(1)" style="padding:4px 12px;min-height:0">+</button> <button type="button" onclick="llZoomReset()" style="padding:4px 12px;min-height:0">Reset</button></span></h3>' + chartCard(s) + '</div>';
   const calHtml = calendarHtml(Date.now(), daily);
   const heroTitle = s.locked ? esc(s.locked.decision) + ': ' + esc(s.locked.side) : 'Watching';
   const heroReason = s.locked ? esc(s.locked.reason) : 'Waiting for the next call';
@@ -1168,7 +1530,7 @@ function page() {
     '<div class="muted">Up ask &middot; Kalshi ' + kAsk + ' &middot; Polymarket US ' + pAsk + '</div>' +
     '<div class="muted">' + (s.feeds || 0) + ' feeds live · RSI 1m ' + (s.rsi1 == null ? '--' : s.rsi1) + ' · whale net 5m ' + (s.whaleNet5m == null ? '--' : usdK(s.whaleNet5m)) + (s.surge ? ' · SURGE' : '') + '</div>' +
     '<div style="margin-top:8px">' + feeds + '</div></div>' +
-    chartHtml + tilesHtml + ctxCard + flowCard + calHtml +
+    chartHtml + tilesHtml + ctxCard + flowCard + tfConfirmCard(s) + calHtml +
     '<div class="card"><h3 style="margin:0 0 8px">Checks</h3><ul style="margin:8px 0;padding-left:20px">' + rows + '</ul></div>' +
     '<h3>Recent rounds</h3><table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
     paperCard() +
@@ -1181,6 +1543,13 @@ function page() {
     'function cls(){editing=false;document.getElementById("edbox").style.display="none"}' +
     'function send(b){var k=document.getElementById("ekey").value;localStorage.llkey=k;fetch("/api/rounds/"+cur+"/edit",{method:"POST",headers:{"Content-Type":"application/json","X-Edit-Key":k},body:JSON.stringify(b)}).then(function(r){return r.text().then(function(t){if(r.ok)location.reload();else document.getElementById("emsg").textContent=t})})}' +
     'function save(){var r=document.getElementById("eres").value;send({side:document.getElementById("eside").value,res:r==="auto"?null:r})}function clr(){send({clear:true})}' +
+    /* Chart zoom: pure client-side view state. zoomViewBox() is embedded from
+       the tested server function; the level persists in localStorage so the
+       5s reload keeps the zoom. Silent no-op when the SVG or storage is
+       unavailable; the reload and the edit box are untouched. */
+    zoomViewBox.toString() + ';var LLZ=[1,1.5,2,3,4];function llZoomApply(){try{var svg=document.getElementById("llchart");if(!svg)return;var L=parseFloat(localStorage.getItem("llChartZoom"))||1;if(LLZ.indexOf(L)<0)L=1;svg.setAttribute("viewBox",zoomViewBox(L));var lb=document.getElementById("llzoomlbl");if(lb)lb.textContent=L+"x";}catch(e){}}' +
+    'function llZoomStep(d){try{var cur=parseFloat(localStorage.getItem("llChartZoom"))||1;var i=LLZ.indexOf(cur);if(i<0)i=0;i=Math.max(0,Math.min(LLZ.length-1,i+d));localStorage.setItem("llChartZoom",String(LLZ[i]));}catch(e){}llZoomApply();}' +
+    'function llZoomReset(){try{localStorage.setItem("llChartZoom","1");}catch(e){}llZoomApply();}llZoomApply();' +
     'setInterval(function(){if(!editing)location.reload()},5000)</script></body>';
 }
 function paperCard() {
