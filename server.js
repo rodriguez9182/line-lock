@@ -3,6 +3,9 @@
   Line Lock watcher v1.1
   Runs the same checks as the Line Lock page, 24/7, and sends a push through ntfy
   when a play locks. Read only: it never trades and never logs in anywhere.
+  Also shows read-only market context on the page (OKX funding + open interest,
+  a macro-event calendar, MACD + reversion readouts, and the Polymarket US
+  15m BTC price next to Kalshi's). Display only; never used for calls.
 
   Environment variables
     NTFY_TOPIC      required. Your private ntfy topic name (long and random).
@@ -88,6 +91,77 @@ function kelly(q, c) {
   const f = (q - c) / (1 - c); return f > 0 ? clamp(f * CFG.kellyFrac, 0, CFG.kellyCap) : 0;
 }
 
+/* ---------- market context (DISPLAY ONLY — never feeds a check, verdict, lock, or order) ----------
+   Two read-only context sources shown on the status page and in /status:
+   1. OKX perpetual funding rate + open interest (public endpoints, no key).
+      Binance/Bybit futures APIs are geo-blocked from this host; OKX works.
+   2. A hardcoded macro-event calendar (CPI / FOMC / one NVDA earnings).
+   Dates were verified against the BLS schedule and the Fed calendar on
+   2026-11-17. Nothing here is consulted by checksFor/analyze/lockLogic. */
+
+/* ET calendar math: Intl with timeZone America/New_York is the source of truth
+   for "today" and for converting an ET wall-clock time to epoch ms. The offset
+   is derived per date (two passes) so DST transitions are handled; events sit
+   at 08:30/14:00/16:00 ET, far from the 02:00 transitions. */
+const etParts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+function etDateKey(ms) {
+  const p = etParts.formatToParts(ms), g = t => p.find(x => x.type === t).value;
+  return g('year') + '-' + g('month') + '-' + g('day');
+}
+function etOffsetMs(ms) {
+  const p = etParts.formatToParts(ms), g = t => +p.find(x => x.type === t).value;
+  return Date.UTC(g('year'), g('month') - 1, g('day'), g('hour') % 24, g('minute'), g('second')) - ms;
+}
+function etWallToMs(dateKey, hour, min) {
+  const guess = Date.UTC(+dateKey.slice(0, 4), +dateKey.slice(5, 7) - 1, +dateKey.slice(8, 10), hour, min);
+  const off1 = etOffsetMs(guess);
+  let ms = guess - off1;
+  const off2 = etOffsetMs(ms);
+  if (off2 !== off1) ms = guess - off2;
+  return ms;
+}
+/* Verified 2026-11-17: CPI dates/times from the BLS release schedule (08:30 ET);
+   FOMC decision dates from the Federal Reserve calendar (statement 14:00 ET on
+   the meeting's second day; 2027 dates are tentative per the Fed). July and
+   October 2027 FOMC dates could not be resolved from the sources checked, so
+   they are deliberately omitted rather than guessed. Payrolls were left out:
+   no verified dates were on hand. */
+const MACRO_EVENTS = [
+  { name: 'NVDA earnings', date: '2026-11-17', hour: 16, min: 0 },
+  { name: 'FOMC decision', date: '2026-12-09', hour: 14, min: 0 },
+  { name: 'CPI', date: '2026-12-10', hour: 8, min: 30 },
+  { name: 'CPI', date: '2027-01-13', hour: 8, min: 30 },
+  { name: 'FOMC decision', date: '2027-01-27', hour: 14, min: 0 },
+  { name: 'CPI', date: '2027-02-11', hour: 8, min: 30 },
+  { name: 'CPI', date: '2027-03-10', hour: 8, min: 30 },
+  { name: 'FOMC decision', date: '2027-03-17', hour: 14, min: 0 },
+  { name: 'CPI', date: '2027-04-13', hour: 8, min: 30 },
+  { name: 'FOMC decision', date: '2027-04-28', hour: 14, min: 0 },
+  { name: 'CPI', date: '2027-05-12', hour: 8, min: 30 },
+  { name: 'FOMC decision', date: '2027-06-09', hour: 14, min: 0 },
+  { name: 'CPI', date: '2027-06-10', hour: 8, min: 30 },
+  { name: 'CPI', date: '2027-07-14', hour: 8, min: 30 },
+  { name: 'CPI', date: '2027-08-11', hour: 8, min: 30 },
+  { name: 'CPI', date: '2027-09-14', hour: 8, min: 30 },
+  { name: 'FOMC decision', date: '2027-09-15', hour: 14, min: 0 },
+  { name: 'CPI', date: '2027-10-14', hour: 8, min: 30 },
+  { name: 'CPI', date: '2027-11-10', hour: 8, min: 30 },
+  { name: 'FOMC decision', date: '2027-11-17', hour: 14, min: 0 },
+  { name: 'FOMC decision', date: '2027-12-08', hour: 14, min: 0 },
+  { name: 'CPI', date: '2027-12-10', hour: 8, min: 30 }
+];
+function eventAtMs(e) { return etWallToMs(e.date, e.hour, e.min); }
+function eventsToday(now) { const k = etDateKey(now); return MACRO_EVENTS.filter(e => e.date === k).map(e => e.name); }
+function nextEvent(now) {
+  let best = null;
+  MACRO_EVENTS.forEach(e => { const at = eventAtMs(e); if (at > now && (!best || at < best.at)) best = { name: e.name, at }; });
+  return best ? { name: best.name, atISO: new Date(best.at).toISOString(), minsUntil: Math.round((best.at - now) / 60000) } : null;
+}
+/* OKX public response shapes, verified live 2026-11-17. fundingRate is a string
+   fraction per ~8h funding period (0.0000403 = +0.004%/8h, neutral). */
+function parseOkxFunding(j) { const d = j && j.data && j.data[0]; const r = d ? parseFloat(d.fundingRate) : NaN; return isFinite(r) ? r : null; }
+function parseOkxOi(j) { const d = j && j.data && j.data[0]; const v = d ? parseFloat(d.oiUsd) : NaN; return isFinite(v) ? v : null; }
+
 /* ---------- state ---------- */
 const FEEDS = {
   coinbase: { name: 'Coinbase', url: 'https://api.exchange.coinbase.com/products/BTC-USD/ticker', parse: j => +j.price },
@@ -96,7 +170,7 @@ const FEEDS = {
   gemini: { name: 'Gemini', url: 'https://api.gemini.com/v1/pubticker/btcusd', parse: j => +j.last },
   bitfinex: { name: 'Bitfinex', url: 'https://api-pub.bitfinex.com/v2/ticker/tBTCUSD', parse: j => +j[6] }
 };
-const S = { prices: {}, trades: [], seen: new Set(), candles: new Map(), book: null, liq: [], hist: [], bt: null, clusters: [], kalshi: null, diag: {}, feedErr: {}, feedDownSince: {}, feedAlerted: {}, pend: [], scanT: null, liveP: {} };
+const S = { prices: {}, trades: [], seen: new Set(), candles: new Map(), book: null, liq: [], hist: [], bt: null, clusters: [], kalshi: null, okx: null, polyUs: null, diag: {}, feedErr: {}, feedDownSince: {}, feedAlerted: {}, pend: [], scanT: null, liveP: {} };
 let R = null, persist = 0, lastCand = null, STATUS = {}, RECENT = [], lastWhaleAlert = 0, LASTA = null;
 const BOOT = Date.now();
 
@@ -183,6 +257,36 @@ function paper() {
   const pnl = bal - CFG.paperBank;
   return { start: CFG.paperBank, mode: CFG.paperMode, fixedStake: CFG.paperFixed, balance: +bal.toFixed(2), pnl: +pnl.toFixed(2), roi: CFG.paperBank ? pnl / CFG.paperBank : null, trades: w + l, open, wins: w, losses: l, winRate: (w + l) ? w / (w + l) : null, fees: +fees.toFixed(2), maxDrawdown: +maxDD.toFixed(2), maxDrawdownPct: maxDDpct, best, worst, recent: trades.slice(-50).reverse() };
 }
+/* Display only: every settled paper trade, replayed exactly like paper() (same
+   round order, same paperSize/orderFee/effRes math, same skips) so the P&L
+   calendar and the tiles use the same P&L figures as the paper tally. paper()
+   only keeps the last 50 trades, which is not enough for a month view, so this
+   mirrors its loop instead of changing paper(). Keep the two loops in sync. */
+function settledPaperTrades() {
+  let bal = CFG.paperBank;
+  const out = [];
+  ROUNDS.slice().sort((a, b) => a.end - b.end).forEach(r => {
+    const L = r.locked; if (!L || L.decision !== 'TAKE' || L.ask == null) return;
+    const res = effRes(r); if (res === 'skip') return;
+    const z = paperSize(bal, L.prob, L.ask); if (z.n < 1) return;
+    const cost = z.n * L.ask, fee = orderFee(z.n, L.ask);
+    if (res !== 'won' && res !== 'lost') return; /* pending: not settled yet, no P&L */
+    const payout = res === 'won' ? z.n : 0, pnl = payout - cost - fee;
+    bal += pnl;
+    out.push({ end: r.end, pnl, res });
+  });
+  return out;
+}
+/* Display only: settled paper P&L grouped by ET calendar date. */
+function dailyPnl() {
+  const m = new Map();
+  settledPaperTrades().forEach(t => {
+    const k = etDateKey(t.end);
+    let d = m.get(k); if (!d) { d = { pnl: 0, w: 0, l: 0 }; m.set(k, d); }
+    d.pnl += t.pnl; if (t.res === 'won') d.w++; else d.l++;
+  });
+  return m;
+}
 function savePaper() { try { const P = paper(); delete P.recent; fs.writeFileSync(path.join(CFG.dataDir, 'paper.json'), JSON.stringify(P, null, 2)); } catch (e) { console.log('could not save paper.json', e.message); } }
 const paperLine = () => { const P = paper(); return 'Paper ' + usd(P.balance) + ' (' + (P.pnl >= 0 ? '+' : '-') + usd(Math.abs(P.pnl)) + ', ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + ', ' + P.wins + '-' + P.losses + ')'; };
 const CSV_COLS = ['id', 'end_iso', 'ticker', 'line', 'line_from', 'final', 'up', 'source', 'mismatch', 'snap_prob_up', 'snap_raw_up', 'snap_mkt_up', 'snap_verdict', 'snap_edge', 'locked_side', 'decision', 'lock_prob', 'lock_ask', 'lock_fee', 'lock_edge', 'checks_passed', 'checks_total', 'reason', 'edited', 'edit_side', 'edit_res', 'result'];
@@ -212,6 +316,31 @@ function indArrays(cs) {
   for (i = 0; i < n; i++) { const tp = (cs[i].h + cs[i].l + cs[i].c) / 3; pv.push(pv[i] + tp * cs[i].v); vv.push(vv[i] + cs[i].v); }
   for (i = 0; i < n; i++) { const a = Math.max(0, i - 59), dv = vv[i + 1] - vv[a]; vwap[i] = dv > 0 ? (pv[i + 1] - pv[a]) / dv : cs[i].c; const b = Math.max(0, i - 19); vavg[i] = (vv[i + 1] - vv[b]) / (i - b + 1); }
   return { rsi, bbU, bbL, vwap, vavg, closes };
+}
+/* ---------- display-only indicators: MACD + reversion readout ----------
+   Pure helper, called from tick() ONLY for the STATUS literal / status page.
+   Nothing in analyze(), checksFor(), lockLogic, paper, stats, CSV, or sizing
+   reads these values. The duplicate indArrays() call is deliberate: separation
+   from decision code matters more than the trivial CPU cost. */
+function computeDisplayIndicators(cs) {
+  const n = cs ? cs.length : 0;
+  if (n < 35) return { macd: null, reversion: null };
+  const ind = indArrays(cs), last = n - 1, closes = ind.closes;
+  /* MACD 12/26/9 on 1-minute closes, in USD. */
+  const e12 = emaSeries(closes, 12), e26 = emaSeries(closes, 26);
+  const macdSeries = closes.map((_, i) => e12[i] - e26[i]);
+  const sig = emaSeries(macdSeries, 9);
+  const r2 = v => Math.round(v * 100) / 100;
+  const macd = { line: r2(macdSeries[last]), signal: r2(sig[last]), hist: r2(macdSeries[last] - sig[last]) };
+  /* Reversion: distance from the rolling VWAP, and Bollinger %B. The label
+     comes from %B ONLY: above the upper band = stretched up, below the lower
+     band = stretched down, inside the bands = near mean. */
+  const vw = ind.vwap[last], close = closes[last];
+  const vwapDistPct = (vw != null && vw !== 0) ? +(((close - vw) / vw) * 100).toFixed(3) : null;
+  const bu = ind.bbU[last], bl = ind.bbL[last];
+  const pctB = (isFinite(bu) && isFinite(bl) && (bu - bl) !== 0) ? +((close - bl) / (bu - bl)).toFixed(4) : null;
+  const label = pctB == null ? null : pctB > 1 ? 'stretched up' : pctB < 0 ? 'stretched down' : 'near mean';
+  return { macd, reversion: { vwapDistPct, pctB, label } };
 }
 const red = k => k.c < k.o, grn = k => k.c > k.o;
 const PATS = [
@@ -512,6 +641,7 @@ function tick() {
   S.liq = S.liq.filter(x => now - x.t <= 3600000);
   const fh = feedHealth(now);
   LASTA = A;
+  const di = computeDisplayIndicators(closedCandles(now)); // display only: never feeds analyze/lock/paper
   STATUS = {
     time: new Date(now).toISOString(), left: mmss(A.left), feeds: A.live.length, feedHealth: fh, price: A.price, line: R.line, lineFrom: R.lineFrom,
     side: A.side, strength: A.strength, prob: A.probSide == null ? null : Math.round(A.probSide * 100),
@@ -520,7 +650,10 @@ function tick() {
     checks: A.checks.map(c => (c.na ? '-' : c.ok ? 'pass' : 'FAIL') + ' ' + c.label + ' (' + c.detail + ')'),
     whaleNet5m: Math.round(A.w300.net), surge: A.surge, rsi1: A.rsi1 == null ? null : +A.rsi1.toFixed(1), rsi5: A.rsi5 == null ? null : +A.rsi5.toFixed(1),
     locked: R.locked ? { side: R.locked.side, decision: R.locked.decision, at: new Date(R.locked.t).toISOString(), reason: R.locked.reason, edge: R.locked.edge } : null,
-    kalshi: A.K ? { ticker: A.K.ticker, yesAsk: A.K.yesAsk, noAsk: A.K.noAsk } : null, diag: S.diag, topicSet: !!CFG.topic, roundsLogged: ROUNDS.length
+    okx: (S.okx && now - S.okx.t < 120000) ? { fundingRate: S.okx.fundingRate, oiUsd: S.okx.oiUsd, t: S.okx.t } : null,
+    events: { today: eventsToday(now), next: nextEvent(now) },
+    macd: di.macd, reversion: di.reversion,
+    kalshi: A.K ? { ticker: A.K.ticker, yesAsk: A.K.yesAsk, noAsk: A.K.noAsk } : null, polyUs: (S.polyUs && S.polyUs.t && now - S.polyUs.t < 60000 && S.polyUs.ask != null) ? { ask: S.polyUs.ask, bid: S.polyUs.bid, slug: S.polyUs.slug } : null, diag: S.diag, topicSet: !!CFG.topic, roundsLogged: ROUNDS.length
   };
   return A;
 }
@@ -569,6 +702,42 @@ function pollKalshi() {
     S.kalshi = { t: Date.now(), ticker: m.ticker, close: x.close, strike: d(m.floor_strike), yesAsk: real(px(m.yes_ask_dollars, m.yes_ask)), noAsk: real(px(m.no_ask_dollars, m.no_ask)) };
   }));
 }
+/* OKX funding + open interest, display only. Failures keep the last good value
+   and back off 30s; the poller never throws and never blocks tick(). */
+let okxBackoffUntil = 0;
+async function pollOkx() {
+  if (Date.now() < okxBackoffUntil) return;
+  try {
+    const fj = await getJSON('https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP', 10000, 'okx:funding');
+    const oj = await getJSON('https://www.okx.com/api/v5/public/open-interest?instId=BTC-USDT-SWAP', 10000, 'okx:oi');
+    const fr = parseOkxFunding(fj), oi = parseOkxOi(oj);
+    if (fr == null || oi == null) throw new Error('bad OKX response');
+    S.okx = { fundingRate: fr, oiUsd: oi, t: Date.now() };
+  } catch (e) { okxBackoffUntil = Date.now() + 30000; }
+}
+/* ---------- Polymarket US price (display only) ---------- */
+/* Shows the Polymarket US 15m BTC up/down top of book next to Kalshi's price.
+   Read-only display: it never feeds the model, the edge math, or paper trading.
+   Polled every 10s (the gateway rate-limits fast polling); failures keep the
+   last good value and back off 30s. */
+function polyUsSlug(t) {
+  const d = new Date(t), p = n => String(n).padStart(2, '0');
+  return 'cpc-btc-updown-15m-' + d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + '-' + p(d.getUTCHours()) + p(d.getUTCMinutes()) + 'z';
+}
+function pollPolyUs() {
+  const now = Date.now();
+  if (S.polyUs && S.polyUs.nextTry && now < S.polyUs.nextTry) return;
+  const t0 = (R && R.start) ? R.start : Math.floor(now / ROUND_MS) * ROUND_MS;
+  const slug = polyUsSlug(t0);
+  getJSON('https://gateway.polymarket.us/v1/markets/' + encodeURIComponent(slug) + '/bbo', 6000, 'polyus').then(j => {
+    const md = j && j.marketData; if (!md) throw new Error('no marketData');
+    const num = o => { const v = o && parseFloat(o.value); return isFinite(v) ? v : null; };
+    S.polyUs = { t: Date.now(), slug, bid: num(md.bestBid), ask: num(md.bestAsk), mid: num(md.currentPx) };
+  }).catch(() => {
+    const prev = S.polyUs || { t: 0, slug, bid: null, ask: null, mid: null };
+    prev.nextTry = Date.now() + 30000; S.polyUs = prev;
+  });
+}
 async function loadHistory() {
   for (let k = 0; k < 6; k++) {
     const end = Date.now() - k * 295 * 60000, start = end - 295 * 60000;
@@ -590,6 +759,32 @@ function connectLiq() {
   open('wss://stream.bybit.com/v5/public/linear', JSON.stringify({ op: 'subscribe', args: ['allLiquidation.BTCUSDT'] }), j => { if (!j.topic || !j.data) return; (Array.isArray(j.data) ? j.data : [j.data]).forEach(d => S.liq.push({ t: Date.now(), side: d.S === 'Buy' ? 'long' : 'short', usd: (+d.v) * (+d.p) })); });
 }
 
+/* ---------- P&L calendar (display only) ----------
+   Current month in America/New_York, Monday-first. Each day cell shows that
+   day's settled paper P&L + W-L from dailyPnl() — the same replay paper()
+   uses. Days with no settled trades show only the day number. */
+function calendarHtml(now, daily) {
+  const p = etParts.formatToParts(now), g = t => p.find(x => x.type === t).value;
+  const y = +g('year'), mo = +g('month');
+  const label = new Date(now).toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'long', year: 'numeric' });
+  const dim = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  const pad = n => String(n).padStart(2, '0');
+  const lead = (new Date(etWallToMs(y + '-' + pad(mo) + '-01', 12, 0)).getUTCDay() + 6) % 7;
+  const todayKey = etDateKey(now);
+  let cells = '';
+  ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'].forEach(d => { cells += '<div class="calhead">' + d + '</div>'; });
+  for (let i = 0; i < lead; i++) cells += '<div></div>';
+  for (let d = 1; d <= dim; d++) {
+    const k = y + '-' + pad(mo) + '-' + pad(d), rec = daily.get(k);
+    const cls = 'calcell' + (rec ? (rec.pnl > 0 ? ' win' : rec.pnl < 0 ? ' loss' : '') : '') + (k === todayKey ? ' today' : '') + (k > todayKey ? ' future' : '');
+    cells += '<div class="' + cls + '"><div class="calday">' + d + '</div>' +
+      (rec ? '<div class="calpnl" style="color:' + (rec.pnl > 0 ? '#34d399' : rec.pnl < 0 ? '#fb7185' : '#eef1f6') + '">' + (rec.pnl >= 0 ? '+' : '-') + usd(Math.abs(rec.pnl), 0) + '</div><div class="calwl">' + rec.w + 'W &middot; ' + rec.l + 'L</div>' : '') + '</div>';
+  }
+  const trail = (7 - ((lead + dim) % 7)) % 7;
+  for (let i = 0; i < trail; i++) cells += '<div></div>';
+  return '<h3>P&amp;L calendar</h3><div class="card"><div style="font-weight:800;margin-bottom:10px">' + esc(label) + ' <span class="muted" style="font-weight:400">&middot; paper P&amp;L by day (ET)</span></div><div class="cal">' + cells + '</div></div>';
+}
+
 /* ---------- tiny web server (health check + status page) ---------- */
 function page() {
   const s = STATUS, rows = (s.checks || []).map(c => '<li>' + esc(c) + '</li>').join('');
@@ -607,19 +802,56 @@ function page() {
   const calRows = st.cal.map(b => '<tr><td>' + b.range + '</td><td>' + b.n + '</td><td>' + pct(b.avgP) + '</td><td>' + pct(b.actual) + '</td><td>' + (b.n >= 20 && b.actual != null ? (b.actual < b.avgP - 0.05 ? '<span style="color:#fb7185">overconfident</span>' : b.actual > b.avgP + 0.05 ? 'underconfident' : '<span style="color:#34d399">ok</span>') : 'need 20+') + '</td></tr>').join('');
   const P = paper();
   const leanPct = s.prob == null ? 0 : Math.min(100, Math.max(0, s.prob));
+  const kAsk = s.kalshi && s.kalshi.yesAsk != null ? Math.round(s.kalshi.yesAsk * 100) + 'c' : '--';
+  const pAsk = s.polyUs && s.polyUs.ask != null ? Math.round(s.polyUs.ask * 100) + 'c' : '--';
+  /* stat tiles + calendar: all from paper()/dailyPnl(), real numbers only */
+  const daily = dailyPnl();
+  let bestDay = null; daily.forEach((d, k) => { if (!bestDay || d.pnl > bestDay.pnl) bestDay = { key: k, pnl: d.pnl, w: d.w, l: d.l }; });
+  const tradingDays = daily.size;
+  const sg = v => (v >= 0 ? '+' : '-') + usd(Math.abs(v));
+  const tileCol = v => v > 0 ? '#34d399' : v < 0 ? '#fb7185' : '#eef1f6';
+  const tile = (label, val, col, sub) => '<div class="tile"><div class="tlabel">' + label + '</div><div class="tval" style="color:' + col + '">' + esc(val) + '</div><div class="tsub">' + esc(sub) + '</div></div>';
+  const tilesHtml = '<div class="tiles">' +
+    tile('Paper P&amp;L', sg(P.pnl), tileCol(P.pnl), usd(P.balance) + ' balance · ' + P.trades + ' trades') +
+    tile('TAKE win rate', P.winRate == null ? '--' : Math.round(P.winRate * 100) + '%', '#eef1f6', P.wins + '-' + P.losses + (P.open ? ' · ' + P.open + ' open' : '')) +
+    tile('Best day', bestDay ? sg(bestDay.pnl) : '$0.00', bestDay ? tileCol(bestDay.pnl) : '#eef1f6', bestDay ? etDate(etWallToMs(bestDay.key, 12, 0)) + ' · ' + bestDay.w + 'W-' + bestDay.l + 'L' : 'no settled trades yet') +
+    tile('Trading days', String(tradingDays), '#eef1f6', 'days with a settled TAKE') +
+    '</div><p class="muted" style="margin:2px 4px 0">All calls ' + st.all.w + '-' + st.all.l + ' (' + wr(st.all.w, st.all.l) + ')</p>';
+  /* market context card: from STATUS fields only, '--' when a source is stale */
+  const o = s.okx;
+  const frTxt = o && o.fundingRate != null ? (o.fundingRate >= 0 ? '+' : '') + (o.fundingRate * 100).toFixed(3) + '%/8h' : '--';
+  const oiTxt = o && o.oiUsd != null ? '$' + (o.oiUsd / 1e9).toFixed(2) + 'B' : '--';
+  const m = s.macd;
+  const usdS = v => v == null ? '--' : (v >= 0 ? '+' : '-') + '$' + Math.abs(v).toFixed(2);
+  const macdTxt = m ? 'MACD ' + usdS(m.line) + ' · signal ' + usdS(m.signal) + ' · hist ' + usdS(m.hist) : '--';
+  const rv = s.reversion;
+  const revTxt = rv ? (rv.vwapDistPct != null ? 'VWAP ' + (rv.vwapDistPct >= 0 ? '+' : '') + rv.vwapDistPct.toFixed(2) + '%' : 'VWAP --') + ' · ' + (rv.pctB != null ? '%B ' + rv.pctB.toFixed(2) : '%B --') + ' · ' + (rv.label || '--') : '--';
+  let evTxt = 'No upcoming events';
+  if (s.events) {
+    if (s.events.today && s.events.today.length) evTxt = 'Today: ' + s.events.today.join(', ');
+    else if (s.events.next) evTxt = 'Next: ' + s.events.next.name + ' · ' + etDate(Date.parse(s.events.next.atISO)) + ' ' + etTime(Date.parse(s.events.next.atISO)) + ' ET';
+  }
+  const ctxCard = '<div class="card"><h3 style="margin:0 0 4px">Market context</h3>' +
+    '<div class="ctxrow"><span class="clabel">Funding rate (OKX perps)</span><span class="cval">' + esc(frTxt) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Open interest (OKX)</span><span class="cval">' + esc(oiTxt) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">MACD 12/26/9</span><span class="cval">' + esc(macdTxt) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Reversion</span><span class="cval">' + esc(revTxt) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Events</span><span class="cval">' + esc(evTxt) + '</span></div></div>';
+  const calHtml = calendarHtml(Date.now(), daily);
   const heroTitle = s.locked ? esc(s.locked.decision) + ': ' + esc(s.locked.side) : 'Watching';
   const heroReason = s.locked ? esc(s.locked.reason) : 'Waiting for the next call';
   return '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Line Lock watcher</title>' +
-    '<style>body{max-width:720px;margin:0 auto}h2{font-size:30px;letter-spacing:-.03em;font-weight:800}h3{font-size:19px;margin:32px 4px 12px;color:#cbd2e1}.card{background:linear-gradient(180deg,#1b1e2a,#14161f);border:1px solid #262a38;border-radius:24px;padding:18px 20px;margin:14px 0;box-shadow:0 8px 24px rgba(0,0,0,.28);overflow-wrap:anywhere}.hero{border:1px solid transparent;background:linear-gradient(#171924,#171924) padding-box,linear-gradient(135deg,#7c5cff,#00c2ff,#34d399) border-box}.big{font-size:42px;font-weight:800;letter-spacing:-.03em;line-height:1.1}.muted{color:#9aa3b2;font-size:14px}.pill{display:inline-block;padding:5px 12px;border-radius:999px;font-weight:700;font-size:14px;background:rgba(52,211,153,.15);color:#34d399}.pill-tape{background:rgba(124,92,255,.18);color:#c4b5fd}.bar{height:10px;border-radius:999px;background:#262a38;overflow:hidden;margin:10px 0}.bar>div{height:100%;background:linear-gradient(90deg,#7c5cff,#00c2ff)}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.grid .card{margin:0}table{border-collapse:collapse;width:100%;background:#14161f;border:1px solid #262a38;border-radius:20px;overflow:hidden;display:block;overflow-x:auto}td,th{padding:12px 14px;border-bottom:1px solid #222634;text-align:left;white-space:nowrap}th{font-size:13px;color:#9aa3b2;font-weight:600}button{background:linear-gradient(135deg,#7c5cff,#00c2ff);color:#fff;border:0;border-radius:999px;padding:10px 18px;font-weight:700;cursor:pointer;min-height:42px}select,input{background:#1b1e2a;color:#eef1f6;border:1px solid #2c3245;border-radius:14px;padding:11px 14px;min-height:42px}a{color:#7dd3fc;text-decoration:none}#edbox{display:none;position:fixed;top:18%;left:50%;transform:translateX(-50%);background:#1b1e2a;border:1px solid #2c3245;padding:20px;border-radius:20px;box-shadow:0 12px 32px rgba(0,0,0,.4);width:min(92vw,380px);z-index:10}details summary{cursor:pointer;color:#cbd2e1}@media(max-width:560px){.grid{grid-template-columns:1fr 1fr}.big{font-size:34px}}</style>' +
+    '<style>body{max-width:720px;margin:0 auto}h2{font-size:30px;letter-spacing:-.03em;font-weight:800}h3{font-size:19px;margin:32px 4px 12px;color:#cbd2e1}.card{background:linear-gradient(180deg,#1b1e2a,#14161f);border:1px solid #262a38;border-radius:24px;padding:18px 20px;margin:14px 0;box-shadow:0 8px 24px rgba(0,0,0,.28);overflow-wrap:anywhere}.hero{border:1px solid transparent;background:linear-gradient(#171924,#171924) padding-box,linear-gradient(135deg,#7c5cff,#00c2ff,#34d399) border-box}.big{font-size:42px;font-weight:800;letter-spacing:-.03em;line-height:1.1}.muted{color:#9aa3b2;font-size:14px}.pill{display:inline-block;padding:5px 12px;border-radius:999px;font-weight:700;font-size:14px;background:rgba(52,211,153,.15);color:#34d399}.pill-tape{background:rgba(124,92,255,.18);color:#c4b5fd}.bar{height:10px;border-radius:999px;background:#262a38;overflow:hidden;margin:10px 0}.bar>div{height:100%;background:linear-gradient(90deg,#7c5cff,#00c2ff)}.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.grid .card{margin:0}table{border-collapse:collapse;width:100%;background:#14161f;border:1px solid #262a38;border-radius:20px;overflow:hidden;display:block;overflow-x:auto}td,th{padding:12px 14px;border-bottom:1px solid #222634;text-align:left;white-space:nowrap}th{font-size:13px;color:#9aa3b2;font-weight:600}button{background:linear-gradient(135deg,#7c5cff,#00c2ff);color:#fff;border:0;border-radius:999px;padding:10px 18px;font-weight:700;cursor:pointer;min-height:42px}select,input{background:#1b1e2a;color:#eef1f6;border:1px solid #2c3245;border-radius:14px;padding:11px 14px;min-height:42px}a{color:#7dd3fc;text-decoration:none}#edbox{display:none;position:fixed;top:18%;left:50%;transform:translateX(-50%);background:#1b1e2a;border:1px solid #2c3245;padding:20px;border-radius:20px;box-shadow:0 12px 32px rgba(0,0,0,.4);width:min(92vw,380px);z-index:10}details summary{cursor:pointer;color:#cbd2e1}@media(max-width:560px){.grid{grid-template-columns:1fr 1fr}.big{font-size:34px}.calpnl{font-size:11px}.calwl{font-size:10px}.calcell{min-height:46px;padding:5px 3px}}.tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}.tile{background:linear-gradient(180deg,#1b1e2a,#14161f);border:1px solid #262a38;border-radius:24px;padding:16px 18px;box-shadow:0 8px 24px rgba(0,0,0,.28)}.tlabel{color:#9aa3b2;font-size:13px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}.tval{font-size:28px;font-weight:800;letter-spacing:-.02em;margin-top:4px}.tsub{color:#9aa3b2;font-size:14px}.ctxrow{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #222634}.ctxrow:last-child{border-bottom:0}.clabel{color:#9aa3b2;font-size:14px}.cval{font-weight:700;text-align:right}.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}.calhead{color:#9aa3b2;font-size:11px;font-weight:700;text-align:center;padding:4px 0;letter-spacing:.05em}.calcell{border:1px solid #262a38;border-radius:12px;padding:6px 4px;min-height:52px;background:#14161f;overflow:hidden}.calcell.win{background:rgba(52,211,153,.10);border-color:rgba(52,211,153,.35)}.calcell.loss{background:rgba(251,113,133,.10);border-color:rgba(251,113,133,.35)}.calcell.today{outline:2px solid #7c5cff}.calcell.future{opacity:.45}.calday{color:#9aa3b2;font-size:11px}.calpnl{font-weight:800;font-size:13px;white-space:nowrap}.calwl{color:#9aa3b2;font-size:11px;white-space:nowrap}</style>' +
     '<body style="font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0d12;color:#eef1f6;padding:16px"><h2>Line Lock</h2><p class="muted" style="margin-top:-8px">BTC 15-minute watcher · Live</p>' +
     '<div class="card hero"><span class="pill">&#9679; ' + heroTitle + '</span> <span class="pill pill-tape">' + heroReason + '</span>' +
     '<div class="big" style="margin-top:12px">' + (s.price == null ? '--' : usd(s.price)) + '</div>' +
     '<div class="muted">Line ' + (s.line == null ? '--' : usd(s.line)) + ' (' + (s.lineFrom || '--') + ') · ' + (s.left || '--') + ' left · lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '% · ' + (s.verdict || '--') + '</div>' +
     '<div style="margin-top:14px"><b>Lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '%</b> <span class="muted">· model up ' + (s.rawProbUp == null ? '--' : s.rawProbUp + '%') + ' · Kalshi up ' + (s.marketProbUp == null ? '--' : s.marketProbUp + '%') + ' · edge ' + (s.edgeCents == null ? '--' : (s.edgeCents >= 0 ? '+' : '') + s.edgeCents + 'c') + (s.stake ? ' · quarter-Kelly ' + usd(s.stake, 0) : '') + '</span></div>' +
     '<div class="bar"><div style="width:' + leanPct + '%"></div></div>' +
+    '<div class="muted">Up ask &middot; Kalshi ' + kAsk + ' &middot; Polymarket US ' + pAsk + '</div>' +
     '<div class="muted">' + (s.feeds || 0) + ' feeds live · RSI 1m ' + (s.rsi1 == null ? '--' : s.rsi1) + ' · whale net 5m ' + (s.whaleNet5m == null ? '--' : usdK(s.whaleNet5m)) + (s.surge ? ' · SURGE' : '') + '</div>' +
     '<div style="margin-top:8px">' + feeds + '</div></div>' +
-    '<div class="grid"><div class="card"><div class="muted">All calls</div><div style="font-size:26px;font-weight:800">' + wr(st.all.w, st.all.l) + '</div><div class="muted">' + st.all.w + '-' + st.all.l + '</div></div><div class="card"><div class="muted">TAKE only</div><div style="font-size:26px;font-weight:800">' + wr(st.take.w, st.take.l) + '</div><div class="muted">' + st.take.w + '-' + st.take.l + ' · ' + (st.take.pnl >= 0 ? '+' : '-') + usd(Math.abs(st.take.pnl)) + ' / contract</div></div><div class="card"><div class="muted">Paper balance</div><div style="font-size:26px;font-weight:800">' + usd(P.balance) + '</div><div class="muted">' + (P.pnl >= 0 ? '+' : '-') + usd(Math.abs(P.pnl)) + ' · ROI ' + (P.roi == null ? '--' : (P.roi * 100).toFixed(1) + '%') + '</div></div></div>' +
+    tilesHtml + ctxCard + calHtml +
     '<div class="card"><h3 style="margin:0 0 8px">Checks</h3><ul style="margin:8px 0;padding-left:20px">' + rows + '</ul></div>' +
     '<h3>Recent rounds</h3><table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
     paperCard() +
@@ -689,9 +921,10 @@ function main() {
   loadRounds();
   newRound(Math.floor(Date.now() / ROUND_MS) * ROUND_MS + ROUND_MS);
   console.log('Line Lock watcher starting. Alerts topic set:', !!CFG.topic, '| whale size', usdK(CFG.whale), '| min edge', CFG.minEdge, '| shrink', CFG.shrink);
+  console.log('Market context (display only): OKX funding + open interest, macro-event calendar, MACD/reversion, Polymarket US price. Never affects calls.');
   startServer();
-  pollPrices(); pollTrades(); pollBook(); pollCandles(); pollKalshi();
-  setInterval(pollPrices, 2000); setInterval(pollTrades, 2500); setInterval(pollBook, 3000); setInterval(pollCandles, 4000); setInterval(pollKalshi, 2000);
+  pollPrices(); pollTrades(); pollBook(); pollCandles(); pollKalshi(); quiet(pollOkx()); pollPolyUs();
+  setInterval(pollPrices, 2000); setInterval(pollTrades, 2500); setInterval(pollBook, 3000); setInterval(pollCandles, 4000); setInterval(pollKalshi, 2000); setInterval(() => quiet(pollOkx()), 60000); setInterval(pollPolyUs, 10000);
   setInterval(pollSettle, 20000);
   loadHistory(); connectLiq();
   setInterval(() => { try { tick(); } catch (e) { console.log('tick error', e.stack || e.message); } }, 1000);
