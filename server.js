@@ -5,7 +5,10 @@
   when a play locks. Read only: it never trades and never logs in anywhere.
   Also shows read-only market context on the page (OKX funding + open interest,
   a macro-event calendar, MACD + reversion readouts, and the Polymarket US
-  15m BTC price next to Kalshi's). Display only; never used for calls.
+  15m BTC price next to Kalshi's), plus display-only readouts (odds trail,
+  taker flow, call grade, distance to line, market gauge, FVG and
+  supply/demand zones) and a BTC chart with zones drawn on it.
+  Display only; never used for calls.
 
   Environment variables
     NTFY_TOPIC      required. Your private ntfy topic name (long and random).
@@ -342,6 +345,161 @@ function computeDisplayIndicators(cs) {
   const label = pctB == null ? null : pctB > 1 ? 'stretched up' : pctB < 0 ? 'stretched down' : 'near mean';
   return { macd, reversion: { vwapDistPct, pctB, label } };
 }
+/* ---------- display-only readouts: odds trail, taker flow, grade, distance, gauge ----------
+   Same rule as computeDisplayIndicators: pure helpers plus one small recorder,
+   consumed ONLY by the STATUS literal in tick() and by page() rendering.
+   No check, verdict, lock, paper, stats, CSV, or hook code reads these. */
+function summarizeOddsTrail(pts, ticker) {
+  if (!pts || !pts.length) return null;
+  let hi = -Infinity, lo = Infinity;
+  for (const p of pts) { if (p.ask > hi) hi = p.ask; if (p.ask < lo) lo = p.ask; }
+  return { ticker: ticker || null, open: pts[0].ask, high: hi, low: lo, last: pts[pts.length - 1].ask, n: pts.length };
+}
+/* Odds trail state: Kalshi yesAsk samples for the current window only.
+   pollKalshi runs every 2s, so 450 entries cover one 15-minute window. */
+let oddsTrailPts = [], oddsTrailTicker = null;
+function recordOddsTick(k) {
+  if (!k || k.yesAsk == null || !isFinite(k.yesAsk)) return summarizeOddsTrail(oddsTrailPts, oddsTrailTicker);
+  if (k.ticker !== oddsTrailTicker) { oddsTrailTicker = k.ticker; oddsTrailPts = []; }
+  oddsTrailPts.push({ t: k.t, ask: k.yesAsk });
+  while (oddsTrailPts.length > 450) oddsTrailPts.shift();
+  return summarizeOddsTrail(oddsTrailPts, oddsTrailTicker);
+}
+/* Taker flow over 15s/30s/60s, from the same S.trades store the flow check
+   already reads (windowFlow). No new feed, no new data. */
+function computeTakerFlow(now) {
+  const w = ms => { const f = windowFlow(now, ms); return { buyUsd: Math.round(f.b), sellUsd: Math.round(f.s), deltaUsd: Math.round(f.b - f.s), buyPct: f.buyPct == null ? null : +f.buyPct.toFixed(1) }; };
+  return { '15s': w(15000), '30s': w(30000), '60s': w(60000) };
+}
+function takerFlowLabel(buyPct) {
+  if (buyPct == null || !isFinite(buyPct)) return null;
+  return buyPct >= 60 ? 'Buyers pressing' : buyPct <= 40 ? 'Sellers pressing' : 'Balanced';
+}
+/* Grade is a pure derivation from the checks already counted in tick():
+   all counted checks = A, one short = B, anything worse = C. */
+function gradeFor(passN, total) {
+  if (total == null || total <= 0 || passN == null) return null;
+  return { grade: passN >= total ? 'A' : passN >= total - 1 ? 'B' : 'C', passN, total };
+}
+function distToLine(price, line) {
+  if (price == null || line == null || !isFinite(price) || !isFinite(line) || line === 0) return null;
+  const d = price - line;
+  return { usd: +d.toFixed(2), pct: +((d / line) * 100).toFixed(3), side: d > 0 ? 'above' : d < 0 ? 'below' : 'at' };
+}
+/* Market gauge: how one-sided the Kalshi market probability is, 0-100.
+   prob is the market-implied P(up) analyze() already computes (midpoint of
+   the yes ask and the implied yes bid, i.e. the same number the page shows
+   as "Kalshi up"); 0.5 = perfectly balanced. */
+function marketGauge(prob) {
+  if (prob == null || !isFinite(prob)) return null;
+  const score = Math.round(Math.abs(prob - 0.5) * 200);
+  return { score, direction: prob > 0.5 ? 'UP' : 'DOWN', label: score < 25 ? 'Balanced' : score < 50 ? 'Leaning' : score < 75 ? 'One-sided' : 'Extreme' };
+}
+/* Fair value gaps (FVG) on the 1-minute candles. A 3-candle gap: bullish when
+   candle[i-2].high < candle[i].low (zone = [high, low]), bearish when
+   candle[i-2].low > candle[i].high (zone = [high, low]). A gap stays open until
+   a LATER candle trades through its far edge: bullish fills when a later low
+   prints at or below the zone low, bearish when a later high prints at or
+   above the zone high. Only the 20 most recently formed open gaps are tracked.
+   Nearest selection uses zones entirely below/above the price: a zone the
+   price is currently inside is being tested, not "below" or "above" it.
+   The returned `open` list (additive field) carries every open gap with its
+   origin candle index, for the chart renderer; the nearest-zone fields and
+   openCount are unchanged.
+   Display only; evaluated every tick (1s), fresher than the 10s requirement. */
+function computeFvgState(cs, price) {
+  const empty = { bullish: null, bearish: null, openCount: 0, open: [] };
+  if (!cs || cs.length < 3) return empty;
+  const px = (price != null && isFinite(price)) ? price : cs[cs.length - 1].c;
+  const open = [];
+  for (let j = 0; j < cs.length; j++) {
+    const c = cs[j];
+    for (let k = open.length - 1; k >= 0; k--) {
+      const f = open[k];
+      if ((f.dir > 0 && c.l <= f.low) || (f.dir < 0 && c.h >= f.high)) open.splice(k, 1);
+    }
+    if (j >= 2) {
+      const a = cs[j - 2];
+      if (a.h < c.l) open.push({ dir: 1, low: a.h, high: c.l, formedAt: j });
+      else if (a.l > c.h) open.push({ dir: -1, low: c.h, high: a.l, formedAt: j });
+    }
+    while (open.length > 20) open.shift();
+  }
+  const last = cs.length - 1;
+  let bull = null, bear = null;
+  for (const f of open) {
+    const zone = { low: Math.round(f.low * 100) / 100, high: Math.round(f.high * 100) / 100, ageCandles: last - f.formedAt };
+    if (f.dir > 0 && f.high <= px && (!bull || zone.high > bull.high)) bull = zone;
+    if (f.dir < 0 && f.low >= px && (!bear || zone.low < bear.low)) bear = zone;
+  }
+  return { bullish: bull, bearish: bear, openCount: open.length, open: open.map(f => ({ dir: f.dir, low: Math.round(f.low * 100) / 100, high: Math.round(f.high * 100) / 100, startIdx: f.formedAt })) };
+}
+/* Supply/demand zones: ONE deterministic rule, documented here.
+   Volatility context (computed once per evaluation from the recent past):
+   - baseMax = 0.5 x median 1-minute range over the last 60 candles.
+   - impulseMin = 1.5 x ATR(14) over the last 14 true ranges.
+   A zone forms at a "base": the longest run of 1-3 consecutive candles
+   starting at some index, each with range below baseMax, immediately
+   followed by an impulse of 1-3 candles whose net move from the last base
+   close clears impulseMin (up = demand, down = supply). The first
+   qualifying impulse length wins; after a zone forms, the scan resumes
+   after the impulse so zones never overlap. Zone = [low, high] of the
+   base candles only. A zone stays untested until a later candle CLOSES
+   through its far edge: demand breaks on a close below the zone low,
+   supply on a close above the zone high (wicks do not break zones).
+   Only the 10 most recently formed untested zones are tracked.
+   The returned `open` list (additive field) carries every untested zone with
+   its base-start candle index, for the chart renderer; the nearest-zone fields
+   and openCount are unchanged.
+   Display only; evaluated every tick alongside computeFvgState. */
+function computeZoneState(cs, price) {
+  const empty = { supply: null, demand: null, openCount: 0, open: [] };
+  if (!cs || cs.length < 15) return empty;
+  const n = cs.length;
+  const medRange = median(cs.slice(-60).map(c => c.h - c.l));
+  const baseMax = 0.5 * medRange;
+  let trSum = 0;
+  for (let i = n - 14; i < n; i++) {
+    const c = cs[i], p = cs[i - 1];
+    trSum += Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c));
+  }
+  const impulseMin = 1.5 * (trSum / 14);
+  const zones = [];
+  let b = 0;
+  while (b < n - 1) {
+    let run = 0;
+    while (run < 3 && b + run < n && (cs[b + run].h - cs[b + run].l) < baseMax) run++;
+    if (!run) { b++; continue; }
+    const baseEnd = b + run - 1, baseClose = cs[baseEnd].c;
+    let lo = Infinity, hi = -Infinity;
+    for (let k = b; k <= baseEnd; k++) { lo = Math.min(lo, cs[k].l); hi = Math.max(hi, cs[k].h); }
+    let formed = null;
+    for (let m = 1; m <= 3; m++) {
+      const e = baseEnd + m;
+      if (e >= n) break;
+      const move = cs[e].c - baseClose;
+      if (move >= impulseMin) { formed = { dir: 1, low: lo, high: hi, formedAt: e, origin: b }; break; }
+      if (-move >= impulseMin) { formed = { dir: -1, low: lo, high: hi, formedAt: e, origin: b }; break; }
+    }
+    if (formed) { zones.push(formed); b = formed.formedAt + 1; }
+    else b++;
+  }
+  const open = zones.filter(z => {
+    for (let j = z.formedAt + 1; j < n; j++) {
+      if ((z.dir > 0 && cs[j].c < z.low) || (z.dir < 0 && cs[j].c > z.high)) return false;
+    }
+    return true;
+  }).slice(-10);
+  const px = (price != null && isFinite(price)) ? price : cs[n - 1].c;
+  const last = n - 1;
+  let dem = null, sup = null;
+  for (const z of open) {
+    const zone = { low: Math.round(z.low * 100) / 100, high: Math.round(z.high * 100) / 100, ageCandles: last - z.formedAt };
+    if (z.dir > 0 && z.high <= px && (!dem || zone.high > dem.high)) dem = zone;
+    if (z.dir < 0 && z.low >= px && (!sup || zone.low < sup.low)) sup = zone;
+  }
+  return { supply: sup, demand: dem, openCount: open.length, open: open.map(z => ({ dir: z.dir, low: Math.round(z.low * 100) / 100, high: Math.round(z.high * 100) / 100, startIdx: z.origin })) };
+}
 const red = k => k.c < k.o, grn = k => k.c > k.o;
 const PATS = [
   { id: 'bearEng', name: 'Bearish engulfing', dir: -1, test: (c, i) => { const a = c[i - 1], b = c[i]; return grn(a) && red(b) && b.o >= a.c && b.c <= a.o; } },
@@ -642,6 +800,14 @@ function tick() {
   const fh = feedHealth(now);
   LASTA = A;
   const di = computeDisplayIndicators(closedCandles(now)); // display only: never feeds analyze/lock/paper
+  const ccs = closedCandles(now);
+  const fv = computeFvgState(ccs, A.price); // display only: re-evaluated every tick (1s)
+  const zn = computeZoneState(ccs, A.price); // display only: same cadence as FVG
+  const tf = computeTakerFlow(now); // display only
+  const ot = summarizeOddsTrail(oddsTrailPts, oddsTrailTicker); // display only
+  const gr = gradeFor(A.passN, A.total); // display only: derived from the checks analyze() already counted
+  const dtl = distToLine(A.price, R.line); // display only
+  const gg = marketGauge(A.mktUp); // display only
   STATUS = {
     time: new Date(now).toISOString(), left: mmss(A.left), feeds: A.live.length, feedHealth: fh, price: A.price, line: R.line, lineFrom: R.lineFrom,
     side: A.side, strength: A.strength, prob: A.probSide == null ? null : Math.round(A.probSide * 100),
@@ -653,6 +819,7 @@ function tick() {
     okx: (S.okx && now - S.okx.t < 120000) ? { fundingRate: S.okx.fundingRate, oiUsd: S.okx.oiUsd, t: S.okx.t } : null,
     events: { today: eventsToday(now), next: nextEvent(now) },
     macd: di.macd, reversion: di.reversion,
+    oddsTrail: ot, takerFlow: tf, grade: gr, distToLine: dtl, gauge: gg, fvg: fv, zones: zn,
     kalshi: A.K ? { ticker: A.K.ticker, yesAsk: A.K.yesAsk, noAsk: A.K.noAsk } : null, polyUs: (S.polyUs && S.polyUs.t && now - S.polyUs.t < 60000 && S.polyUs.ask != null) ? { ask: S.polyUs.ask, bid: S.polyUs.bid, slug: S.polyUs.slug } : null, diag: S.diag, topicSet: !!CFG.topic, roundsLogged: ROUNDS.length
   };
   return A;
@@ -700,6 +867,7 @@ function pollKalshi() {
     /* 0 or 1 dollar asks mean "no offer", not a real price */
     const real = v => (v != null && v > 0 && v < 1) ? v : null;
     S.kalshi = { t: Date.now(), ticker: m.ticker, close: x.close, strike: d(m.floor_strike), yesAsk: real(px(m.yes_ask_dollars, m.yes_ask)), noAsk: real(px(m.no_ask_dollars, m.no_ask)) };
+    recordOddsTick(S.kalshi); // display only: odds trail for the current window
   }));
 }
 /* OKX funding + open interest, display only. Failures keep the last good value
@@ -786,6 +954,147 @@ function calendarHtml(now, daily) {
 }
 
 /* ---------- tiny web server (health check + status page) ---------- */
+/* ---------- display-only BTC chart: 1-minute candles + FVG / supply-demand overlays ----------
+   Server-rendered inline SVG from candles already in memory. chartCard() (called
+   from page() only) recomputes the FVG/zone state from one consistent candle
+   snapshot; the page's existing 5s reload refreshes the chart, faster than the
+   requested 10s cadence. No client JS, no new feeds, no new timers. Nothing
+   outside page() rendering reads this.
+   chartSvg(candles, opts): candles = closed 1-minute candles, ascending t
+   (the caller passes the last 60); opts = { fvg, zones } open lists from
+   computeFvgState/computeZoneState (entries carry dir/low/high/startIdx, where
+   startIdx is the origin candle's index in the FULL array the helpers saw),
+   baseIndex = index of candles[0] in that full array, line = Kalshi line,
+   price = current price. Zone rects run from the origin candle to the right
+   edge; rects are capped at the 8 nearest to price. */
+function chartSvg(candles, opts) {
+  const o = opts || {};
+  const cs = (candles || []).filter(c => c && isFinite(c.o) && isFinite(c.h) && isFinite(c.l) && isFinite(c.c) && isFinite(c.t));
+  if (cs.length < 10) return '<p class="muted">Chart loading…</p>';
+  const W = 680, H = 260, L = 8, R = 56, T = 10, B = 18, PW = W - L - R, PH = H - T - B;
+  let lo = Infinity, hi = -Infinity;
+  for (const c of cs) { if (c.l < lo) lo = c.l; if (c.h > hi) hi = c.h; }
+  const line = isFinite(o.line) ? o.line : null, price = isFinite(o.price) ? o.price : null;
+  if (line != null) { lo = Math.min(lo, line); hi = Math.max(hi, line); }
+  if (price != null) { lo = Math.min(lo, price); hi = Math.max(hi, price); }
+  let range = hi - lo;
+  if (!isFinite(range) || range <= 0) { lo -= 1; hi += 1; range = hi - lo; }
+  const pad = Math.max(range * 0.04, 0.25);
+  lo -= pad; hi += pad; range = hi - lo;
+  const y = p => T + (hi - p) / range * PH;
+  const r1 = v => Math.round(v * 10) / 10;
+  const n = cs.length, slot = PW / n, bw = Math.max(2, slot * 0.6);
+  const cx = i => L + i * slot + slot / 2;
+  const parts = [];
+  parts.push('<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" role="img" aria-label="BTC 1-minute chart" style="display:block;background:#14161f;border-radius:16px">');
+  /* gridlines + price labels */
+  for (let k = 0; k < 4; k++) {
+    const p = lo + range * (k / 3), gy = r1(y(p));
+    parts.push('<line class="gl" x1="' + L + '" y1="' + gy + '" x2="' + (L + PW) + '" y2="' + gy + '" stroke="#262a38" stroke-width="1"/>');
+    parts.push('<text x="' + (L + PW + 6) + '" y="' + r1(gy + 3) + '" font-size="10" fill="#9aa3b2">' + fmtN(p, 0) + '</text>');
+  }
+  /* zone rects: nearest to price first, capped at 8, drawn behind the candles */
+  const rects = [];
+  const pushZone = (z, kind) => {
+    if (!z || !isFinite(z.low) || !isFinite(z.high) || z.high <= z.low) return;
+    if (z.high < lo || z.low > hi) return; /* entirely off-chart */
+    const d = price == null ? 0 : price > z.high ? price - z.high : price < z.low ? z.low - price : 0;
+    rects.push({ kind, dir: z.dir, low: z.low, high: z.high, startIdx: z.startIdx, dist: d });
+  };
+  (o.fvg || []).forEach(z => pushZone(z, 'fvg'));
+  (o.zones || []).forEach(z => pushZone(z, 'zone'));
+  rects.sort((a, b) => a.dist - b.dist);
+  const base = isFinite(o.baseIndex) ? o.baseIndex : 0;
+  for (const z of rects.slice(0, 8)) {
+    const x0 = L + Math.max(0, (isFinite(z.startIdx) ? z.startIdx : 0) - base) * slot;
+    if (x0 >= L + PW) continue;
+    const yT = y(Math.min(z.high, hi)), yB = y(Math.max(z.low, lo));
+    const h = Math.max(1, yB - yT);
+    const up = z.dir > 0, col = up ? '#34d399' : '#fb7185';
+    const isZone = z.kind === 'zone';
+    parts.push('<rect class="zn" x="' + r1(x0) + '" y="' + r1(yT) + '" width="' + r1(L + PW - x0) + '" height="' + r1(h) + '" fill="' + col + '" fill-opacity="' + (isZone ? '0.12' : '0.08') + '"' + (isZone ? ' stroke="' + col + '" stroke-width="1" stroke-dasharray="4 3" stroke-opacity="0.55"' : '') + '/>');
+    const label = isZone ? (up ? 'DEMAND' : 'SUPPLY') : 'FVG';
+    const ly = Math.min(yT + 11, T + PH - 3);
+    parts.push('<text x="' + r1(x0 + 4) + '" y="' + r1(ly) + '" font-size="9" font-weight="700" fill="' + col + '" opacity="0.9" style="paint-order:stroke" stroke="#14161f" stroke-width="3">' + label + '</text>');
+  }
+  /* candles: wick + body */
+  for (let i = 0; i < n; i++) {
+    const c = cs[i], col = c.c >= c.o ? '#34d399' : '#fb7185', x = cx(i);
+    parts.push('<line class="wk" x1="' + r1(x) + '" y1="' + r1(y(c.h)) + '" x2="' + r1(x) + '" y2="' + r1(y(c.l)) + '" stroke="' + col + '" stroke-width="1"/>');
+    const yT = y(Math.max(c.o, c.c)), yB = y(Math.min(c.o, c.c));
+    parts.push('<rect class="bd" x="' + r1(x - bw / 2) + '" y="' + r1(yT) + '" width="' + r1(bw) + '" height="' + r1(Math.max(1, yB - yT)) + '" fill="' + col + '"/>');
+  }
+  /* reference lines: Kalshi line (dashed) + current price (dotted). If the two
+     lines nearly coincide, the price label drops below its line. */
+  const refLine = (val, col, dash, label, below) => {
+    const yy = y(val);
+    parts.push('<line class="rl" x1="' + L + '" y1="' + r1(yy) + '" x2="' + (L + PW) + '" y2="' + r1(yy) + '" stroke="' + col + '" stroke-width="1" stroke-dasharray="' + dash + '"/>');
+    const ly = below ? yy + 12 : yy - 4;
+    parts.push('<text x="' + (L + 4) + '" y="' + r1(Math.max(T + 10, Math.min(T + PH - 2, ly))) + '" font-size="10" font-weight="700" fill="' + col + '" style="paint-order:stroke" stroke="#14161f" stroke-width="3">' + label + '</text>');
+  };
+  if (line != null && price != null && Math.abs(y(line) - y(price)) < 13) {
+    refLine(line, '#c4b5fd', '6 4', 'LINE ' + usd(line, 0), false);
+    refLine(price, '#eef1f6', '2 3', usd(price, 0), true);
+  } else {
+    if (line != null) refLine(line, '#c4b5fd', '6 4', 'LINE ' + usd(line, 0), false);
+    if (price != null) refLine(price, '#eef1f6', '2 3', usd(price, 0), false);
+  }
+  /* time labels: first / middle / last candle, ET */
+  [0, Math.floor(n / 2), n - 1].forEach(i => {
+    parts.push('<text x="' + r1(cx(i)) + '" y="' + (H - 4) + '" font-size="10" fill="#9aa3b2" text-anchor="middle">' + etTime(cs[i].t) + '</text>');
+  });
+  parts.push('</svg>');
+  const out = parts.join('');
+  return /NaN|undefined/.test(out) ? '<p class="muted">Chart loading…</p>' : out;
+}
+function chartCard(s) {
+  const ccs = closedCandles(Date.now());
+  const vis = ccs.slice(-60);
+  const fv = computeFvgState(ccs, s.price);
+  const zn = computeZoneState(ccs, s.price);
+  return chartSvg(vis, { fvg: fv.open, zones: zn.open, baseIndex: ccs.length - vis.length, line: s.line, price: s.price });
+}
+/* Row values for the Market context and Flow & levels cards. Display only:
+   the same numbers as the shadow readouts, without sentence prefixes, so
+   every card row reads "label on the left, value on the right". */
+function gaugeTxt(s) {
+  const g = s.gauge;
+  if (!g) return '--';
+  return g.score + '/100 · ' + g.direction + ' heavy · ' + g.label;
+}
+function distTxt(s) {
+  const d = s.distToLine;
+  if (!d) return '--';
+  if (d.side === 'at') return 'At the line';
+  return usd(Math.abs(d.usd)) + ' ' + d.side + ' the line (' + (d.pct >= 0 ? '+' : '') + d.pct.toFixed(2) + '%)';
+}
+function oddsTxt(s) {
+  const o = s.oddsTrail;
+  if (!o) return '--';
+  return cents(o.open) + ' → ' + cents(o.last) + ' · high ' + cents(o.high) + ' · low ' + cents(o.low) + ' · ' + o.n + ' samples';
+}
+function flowTxt(s) {
+  const tf = s.takerFlow;
+  const w15 = tf && tf['15s'], w30 = tf && tf['30s'], w60 = tf && tf['60s'];
+  if (!w15 && !w30 && !w60) return '--';
+  const bp = w => (w && w.buyPct != null) ? Math.round(w.buyPct) + '% buy' : '--';
+  const head = (w15 && w15.buyPct != null)
+    ? 'Buy ' + usdK(w15.buyUsd) + ' · Sell ' + usdK(w15.sellUsd) + ' · Δ ' + (w15.deltaUsd >= 0 ? '+' : '-') + usdK(Math.abs(w15.deltaUsd)) + ' · ' + Math.round(w15.buyPct) + '% buy — ' + takerFlowLabel(w15.buyPct)
+    : 'no fills in 15s';
+  return '15s: ' + head + ' · 30s: ' + bp(w30) + ' · 60s: ' + bp(w60);
+}
+function fvgTxt(s) {
+  const f = s.fvg;
+  if (!f) return '--';
+  const z = x => x ? usd(x.low, 0) + '–' + usd(x.high, 0) : '--';
+  return 'Below ' + z(f.bullish) + ' · Above ' + z(f.bearish);
+}
+function zonesTxt(s) {
+  const zn = s.zones;
+  if (!zn) return '--';
+  const w = x => x ? usd(x.low, 0) + '–' + usd(x.high, 0) : '--';
+  return 'Supply ' + w(zn.supply) + ' · Demand ' + w(zn.demand);
+}
 function page() {
   const s = STATUS, rows = (s.checks || []).map(c => '<li>' + esc(c) + '</li>').join('');
   const st = stats();
@@ -832,11 +1141,19 @@ function page() {
     else if (s.events.next) evTxt = 'Next: ' + s.events.next.name + ' · ' + etDate(Date.parse(s.events.next.atISO)) + ' ' + etTime(Date.parse(s.events.next.atISO)) + ' ET';
   }
   const ctxCard = '<div class="card"><h3 style="margin:0 0 4px">Market context</h3>' +
+    '<div class="ctxrow"><span class="clabel">Market gauge</span><span class="cval">' + esc(gaugeTxt(s)) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Distance to line</span><span class="cval">' + esc(distTxt(s)) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Odds trail</span><span class="cval">' + esc(oddsTxt(s)) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">Funding rate (OKX perps)</span><span class="cval">' + esc(frTxt) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">Open interest (OKX)</span><span class="cval">' + esc(oiTxt) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">MACD 12/26/9</span><span class="cval">' + esc(macdTxt) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">Reversion</span><span class="cval">' + esc(revTxt) + '</span></div>' +
     '<div class="ctxrow"><span class="clabel">Events</span><span class="cval">' + esc(evTxt) + '</span></div></div>';
+  const flowCard = '<div class="card"><h3 style="margin:0 0 4px">Flow &amp; levels</h3>' +
+    '<div class="ctxrow"><span class="clabel">Taker flow</span><span class="cval">' + esc(flowTxt(s)) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Fair value gaps</span><span class="cval">' + esc(fvgTxt(s)) + '</span></div>' +
+    '<div class="ctxrow"><span class="clabel">Supply / demand zones</span><span class="cval">' + esc(zonesTxt(s)) + '</span></div></div>';
+  const chartHtml = '<div class="card"><h3 style="margin:0 0 8px">BTC · 1-minute</h3>' + chartCard(s) + '</div>';
   const calHtml = calendarHtml(Date.now(), daily);
   const heroTitle = s.locked ? esc(s.locked.decision) + ': ' + esc(s.locked.side) : 'Watching';
   const heroReason = s.locked ? esc(s.locked.reason) : 'Waiting for the next call';
@@ -846,12 +1163,12 @@ function page() {
     '<div class="card hero"><span class="pill">&#9679; ' + heroTitle + '</span> <span class="pill pill-tape">' + heroReason + '</span>' +
     '<div class="big" style="margin-top:12px">' + (s.price == null ? '--' : usd(s.price)) + '</div>' +
     '<div class="muted">Line ' + (s.line == null ? '--' : usd(s.line)) + ' (' + (s.lineFrom || '--') + ') · ' + (s.left || '--') + ' left · lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '% · ' + (s.verdict || '--') + '</div>' +
-    '<div style="margin-top:14px"><b>Lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '%</b> <span class="muted">· model up ' + (s.rawProbUp == null ? '--' : s.rawProbUp + '%') + ' · Kalshi up ' + (s.marketProbUp == null ? '--' : s.marketProbUp + '%') + ' · edge ' + (s.edgeCents == null ? '--' : (s.edgeCents >= 0 ? '+' : '') + s.edgeCents + 'c') + (s.stake ? ' · quarter-Kelly ' + usd(s.stake, 0) : '') + '</span></div>' +
+    '<div style="margin-top:14px"><b>Lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '%' + (s.grade ? ' · Grade ' + esc(s.grade.grade) + ' · ' + s.grade.passN + '/' + s.grade.total : '') + '</b> <span class="muted">· model up ' + (s.rawProbUp == null ? '--' : s.rawProbUp + '%') + ' · Kalshi up ' + (s.marketProbUp == null ? '--' : s.marketProbUp + '%') + ' · edge ' + (s.edgeCents == null ? '--' : (s.edgeCents >= 0 ? '+' : '') + s.edgeCents + 'c') + (s.stake ? ' · quarter-Kelly ' + usd(s.stake, 0) : '') + '</span></div>' +
     '<div class="bar"><div style="width:' + leanPct + '%"></div></div>' +
     '<div class="muted">Up ask &middot; Kalshi ' + kAsk + ' &middot; Polymarket US ' + pAsk + '</div>' +
     '<div class="muted">' + (s.feeds || 0) + ' feeds live · RSI 1m ' + (s.rsi1 == null ? '--' : s.rsi1) + ' · whale net 5m ' + (s.whaleNet5m == null ? '--' : usdK(s.whaleNet5m)) + (s.surge ? ' · SURGE' : '') + '</div>' +
     '<div style="margin-top:8px">' + feeds + '</div></div>' +
-    tilesHtml + ctxCard + calHtml +
+    chartHtml + tilesHtml + ctxCard + flowCard + calHtml +
     '<div class="card"><h3 style="margin:0 0 8px">Checks</h3><ul style="margin:8px 0;padding-left:20px">' + rows + '</ul></div>' +
     '<h3>Recent rounds</h3><table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
     paperCard() +
