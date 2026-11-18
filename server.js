@@ -177,6 +177,11 @@ const FEEDS = {
 };
 const S = { prices: {}, trades: [], seen: new Set(), candles: new Map(), book: null, liq: [], hist: [], bt: null, clusters: [], kalshi: null, okx: null, polyUs: null, diag: {}, feedErr: {}, feedDownSince: {}, feedAlerted: {}, pend: [], scanT: null, liveP: {} };
 let R = null, persist = 0, lastCand = null, STATUS = {}, RECENT = [], lastWhaleAlert = 0, LASTA = null;
+/* Display-only call snapshot: the locking tick's analysis, frozen so the hero
+   and the Checks list stop flip-flopping after a call locks. Set in tick()
+   only, cleared when the round rolls. Read by STATUS/page only; never feeds
+   analyze/lock/paper. */
+let LOCK_SNAP = null;
 const BOOT = Date.now();
 
 function newRound(end) { R = { end, start: end - ROUND_MS, line: null, lineFrom: null, locked: null, lean: null, snap: null, ticker: null, surgeNotified: false }; persist = 0; lastCand = null; return R; }
@@ -702,6 +707,12 @@ const tfSubBuckets = { '10s': [], '15s': [], '30s': [] };
    tfFireAlerts() records the states it finds on its first run WITHOUT
    firing: a frame already locked in before a restart is not a new lock-in. */
 const tfAlerted = {};
+/* Per-window timeframe latch: once a frame locks in during a round it keeps
+   showing that direction until the round rolls, even if the raw EMA/RSI/VWAP
+   conditions stop agreeing. Display only; tick() maintains it and
+   applyTfLatch() is the only other reader. */
+const tfLatched = {};
+let tfLatchRoundEnd = null;
 function tfAggregateCandles(cs, bucketMs) {
   const g = new Map();
   for (const c of cs) {
@@ -748,6 +759,26 @@ function computeTfConfirm(ccs, subBuckets) {
     : up > 0 && down > 0 ? 'Mixed · ' + up + ' UP / ' + down + ' DOWN'
     : 'None locked in';
   return { frames, order: TF_ORDER.slice(), up, down, warming, summary };
+}
+/* Display-only latch overlay: returns a NEW tfc-shaped object in which every
+   frame named in `latched` shows locked in its latched direction, whatever
+   the raw frame says; unlatched frames pass through untouched. Counts and
+   the summary are recomputed from the latched frames with the same rules as
+   computeTfConfirm. Pure: reads its arguments only, never module state. */
+function applyTfLatch(tfc, latched) {
+  if (!tfc) return tfc;
+  const frames = {};
+  for (const name of tfc.order) {
+    const f = tfc.frames[name];
+    frames[name] = (f && latched && latched[name]) ? { ...f, locked: true, dir: latched[name] } : f;
+  }
+  let up = 0, down = 0, warming = 0;
+  for (const name of tfc.order) { const f = frames[name]; if (!f) continue; if (f.warmingUp) warming++; else if (f.locked && f.dir === 'UP') up++; else if (f.locked && f.dir === 'DOWN') down++; }
+  const summary = up > 0 && down === 0 ? up + ' of ' + tfc.order.length + ' locked in UP'
+    : down > 0 && up === 0 ? down + ' of ' + tfc.order.length + ' locked in DOWN'
+    : up > 0 && down > 0 ? 'Mixed · ' + up + ' UP / ' + down + ' DOWN'
+    : 'None locked in';
+  return { frames, order: tfc.order.slice(), up, down, warming, summary };
 }
 function recordTfTick(now, price, store) {
   if (price == null || !isFinite(price)) return;
@@ -1015,7 +1046,7 @@ function applyAutoLine(A, now) {
    its breakeven win rate (mean ask). This stops one bad day from banning a good setup. */
 function lockLogic(A, now) {
   if (R.locked || A.price == null || R.line == null || !A.side) { persist = 0; lastCand = null; return; }
-  const inWin = A.left <= 720 && A.left >= 45; let cand = null;
+  const inWin = A.left <= 780 && A.left >= 45; let cand = null;
   if (inWin && A.verdict === 'TAKE') cand = { side: A.side, reason: 'All signs aligned' };
   else if (inWin && A.whaleOk) cand = { side: A.surgeSgn > 0 ? 'UP' : 'DOWN', reason: 'Whale surge ' + (A.surgeSgn > 0 ? 'buying ' : 'selling ') + usdK(Math.abs(A.w90.net)) + ' in 90s' };
   if (cand && cand.side === lastCand) persist++; else persist = cand ? 1 : 0;
@@ -1091,10 +1122,22 @@ function pollSettle() {
 function tick() {
   const now = Date.now();
   rollRound(now);
+  if (LOCK_SNAP && LOCK_SNAP.roundEnd !== R.end) LOCK_SNAP = null;
   const pre = liveFeeds(now); if (pre.length) S.hist.push({ t: now, p: mean(pre.map(f => f.p)) });
   while (S.hist.length && S.hist[0].t < now - 20 * 60000) S.hist.shift();
   let A = analyze(now); applyAutoLine(A, now); if (R.line !== A.line) A = analyze(now);
   lockLogic(A, now); leanLogic(A, now); whaleHeadsUp(A, now); feedWatch(now);
+  /* Display-only call snapshot: freeze the hero/checks on the first tick the
+     round has a lock. Reads A and R.locked only; never feeds decisions. */
+  if (R.locked && !LOCK_SNAP) {
+    LOCK_SNAP = {
+      roundEnd: R.end, at: R.locked.t, side: R.locked.side, decision: R.locked.decision, reason: R.locked.reason,
+      prob: A.probSide == null ? null : Math.round(A.probSide * 100),
+      edgeCents: A.edge == null ? null : Math.round(A.edge * 100),
+      passN: A.passN, total: A.total, grade: gradeFor(A.passN, A.total),
+      checks: A.checks.map(c => (c.na ? '-' : c.ok ? 'pass' : 'FAIL') + ' ' + c.label + ' (' + c.detail + ')')
+    };
+  }
   S.liq = S.liq.filter(x => now - x.t <= 3600000);
   const fh = feedHealth(now);
   LASTA = A;
@@ -1113,6 +1156,12 @@ function tick() {
   const rk = computeRiskLine(dtl, A.left, ccs); // display only
   recordTfTick(now, A.price); // display only: sub-minute buckets for timeframe confirmation
   const tfc = computeTfConfirm(ccs, tfSubBuckets); // display only: never feeds analyze/lock/paper
+  /* Per-window timeframe latch: a new round clears the latch and the
+     per-frame alert memory (tfAlerted.__primed and the quiet-boot guard are
+     untouched), then the first lock-in of the window latches each frame. */
+  if (R.end !== tfLatchRoundEnd) { for (const name of TF_ORDER) delete tfLatched[name]; tfLatchRoundEnd = R.end; for (const name of TF_ORDER) delete tfAlerted[name]; }
+  for (const name of TF_ORDER) { const f = tfc.frames[name]; if (f && f.locked && f.dir && !tfLatched[name]) tfLatched[name] = f.dir; }
+  const tfcShown = applyTfLatch(tfc, tfLatched); // display only: latched frames never unlock within the window
   STATUS = {
     time: new Date(now).toISOString(), left: mmss(A.left), feeds: A.live.length, feedHealth: fh, price: A.price, line: R.line, lineFrom: R.lineFrom,
     side: A.side, strength: A.strength, prob: A.probSide == null ? null : Math.round(A.probSide * 100),
@@ -1121,14 +1170,15 @@ function tick() {
     checks: A.checks.map(c => (c.na ? '-' : c.ok ? 'pass' : 'FAIL') + ' ' + c.label + ' (' + c.detail + ')'),
     whaleNet5m: Math.round(A.w300.net), surge: A.surge, rsi1: A.rsi1 == null ? null : +A.rsi1.toFixed(1), rsi5: A.rsi5 == null ? null : +A.rsi5.toFixed(1),
     locked: R.locked ? { side: R.locked.side, decision: R.locked.decision, at: new Date(R.locked.t).toISOString(), reason: R.locked.reason, edge: R.locked.edge } : null,
+    callSnap: LOCK_SNAP,
     okx: (S.okx && now - S.okx.t < 120000) ? { fundingRate: S.okx.fundingRate, oiUsd: S.okx.oiUsd, t: S.okx.t } : null,
     events: { today: eventsToday(now), next: nextEvent(now) },
     macd: di.macd, reversion: di.reversion,
-    oddsTrail: ot, takerFlow: tf, grade: gr, distToLine: dtl, gauge: gg, fvg: fv, zones: zn, tfConfirm: tfc,
+    oddsTrail: ot, takerFlow: tf, grade: gr, distToLine: dtl, gauge: gg, fvg: fv, zones: zn, tfConfirm: tfcShown,
     liquidity: lq, orderBlocks: ob, session: sn, risk: rk,
     kalshi: A.K ? { ticker: A.K.ticker, yesAsk: A.K.yesAsk, noAsk: A.K.noAsk } : null, polyUs: (S.polyUs && S.polyUs.t && now - S.polyUs.t < 60000 && S.polyUs.ask != null) ? { ask: S.polyUs.ask, bid: S.polyUs.bid, slug: S.polyUs.slug } : null, diag: S.diag, topicSet: !!CFG.topic, roundsLogged: ROUNDS.length
   };
-  tfFireAlerts(tfc, A.price); // display only: one-shot lock-in alerts, deduped; never affects decisions
+  tfFireAlerts(tfcShown, A.price); // display only: one-shot lock-in alerts, deduped; never affects decisions
   return A;
 }
 
@@ -1284,11 +1334,38 @@ function zoomViewBox(level) {
   const w = W / L, h = H / L;
   return r(W - w) + ' ' + r(H - h) + ' ' + r(w) + ' ' + r(h);
 }
+/* Timeframe-charts collapse persistence, shared by the page script and the
+   tests: the function source is embedded in the page
+   (llTfChartsRestore.toString()), so the shipped client code IS the tested
+   code. Default open; the open/closed state persists in localStorage across
+   the 5s reloads. Silent no-op when the element or storage is unavailable;
+   the reload, the edit box, and the chart zoom are untouched. */
+function llTfChartsRestore() {
+  try {
+    var d = document.getElementById('lltfcharts');
+    if (!d) return;
+    var v = null;
+    try { v = localStorage.getItem('llTfChartsOpen'); } catch (e) { v = null; }
+    if (v === '0') d.removeAttribute('open'); else d.setAttribute('open', '');
+    d.addEventListener('toggle', function () {
+      try { localStorage.setItem('llTfChartsOpen', d.open ? '1' : '0'); } catch (e) { }
+    });
+  } catch (e) { }
+}
+/* chartSvg generalized via opts ONLY (Nov 17, timeframe charts): height
+   (default 260), id (default 'llchart'), showZones (default true), label
+   (default 'BTC 1-minute chart'). The main-chart call passes none of these,
+   so it renders byte-identically to before; compact per-timeframe charts
+   pass height 140, a distinct id, showZones false, and their own label. */
 function chartSvg(candles, opts) {
   const o = opts || {};
+  const H = (isFinite(o.height) && o.height > 0) ? o.height : 260;
+  const svgId = (typeof o.id === 'string' && o.id) ? o.id : 'llchart';
+  const showZones = o.showZones !== false;
+  const label = (typeof o.label === 'string' && o.label) ? o.label : 'BTC 1-minute chart';
   const cs = (candles || []).filter(c => c && isFinite(c.o) && isFinite(c.h) && isFinite(c.l) && isFinite(c.c) && isFinite(c.t));
   if (cs.length < 10) return '<p class="muted">Chart loading…</p>';
-  const W = 680, H = 260, L = 8, R = 56, T = 10, B = 18, PW = W - L - R, PH = H - T - B;
+  const W = 680, L = 8, R = 56, T = 10, B = 18, PW = W - L - R, PH = H - T - B;
   let lo = Infinity, hi = -Infinity;
   for (const c of cs) { if (c.l < lo) lo = c.l; if (c.h > hi) hi = c.h; }
   const line = isFinite(o.line) ? o.line : null, price = isFinite(o.price) ? o.price : null;
@@ -1303,7 +1380,7 @@ function chartSvg(candles, opts) {
   const n = cs.length, slot = PW / n, bw = Math.max(2, slot * 0.6);
   const cx = i => L + i * slot + slot / 2;
   const parts = [];
-  parts.push('<svg id="llchart" viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" role="img" aria-label="BTC 1-minute chart" style="display:block;background:#14161f;border-radius:16px">');
+  parts.push('<svg id="' + svgId + '" viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '" role="img" aria-label="' + label + '" style="display:block;background:#14161f;border-radius:16px">');
   /* gridlines + price labels */
   for (let k = 0; k < 4; k++) {
     const p = lo + range * (k / 3), gy = r1(y(p));
@@ -1318,8 +1395,10 @@ function chartSvg(candles, opts) {
     const d = price == null ? 0 : price > z.high ? price - z.high : price < z.low ? z.low - price : 0;
     rects.push({ kind, dir: z.dir, low: z.low, high: z.high, startIdx: z.startIdx, dist: d });
   };
-  (o.fvg || []).forEach(z => pushZone(z, 'fvg'));
-  (o.zones || []).forEach(z => pushZone(z, 'zone'));
+  if (showZones) {
+    (o.fvg || []).forEach(z => pushZone(z, 'fvg'));
+    (o.zones || []).forEach(z => pushZone(z, 'zone'));
+  }
   rects.sort((a, b) => a.dist - b.dist);
   const base = isFinite(o.baseIndex) ? o.baseIndex : 0;
   for (const z of rects.slice(0, 8)) {
@@ -1370,6 +1449,57 @@ function chartCard(s) {
   const fv = computeFvgState(ccs, s.price);
   const zn = computeZoneState(ccs, s.price);
   return chartSvg(vis, { fvg: fv.open, zones: zn.open, baseIndex: ccs.length - vis.length, line: s.line, price: s.price });
+}
+/* ---------- compact chart per timeframe (DISPLAY ONLY) ----------
+   One drawn chart for each of the six non-1m timeframes, in a collapsible
+   section after the Timeframe confirmation card. The 1m chart is NOT
+   duplicated — the main chart above already covers it.
+   Compact charts show candles + the Kalshi line + the current price ONLY:
+   FVGs and supply/demand zones are computed on 1-minute candles, so drawing
+   them on other timeframes would be wrong. Each compact chart gets its own
+   svg id (never 'llchart'), so the zoom script only ever touches the main
+   chart; compact charts have no zoom controls. Headers reuse the lock-in
+   state from STATUS.tfConfirm — states are never recomputed here. No new
+   STATUS fields: the charts render purely from candles + tfConfirm. */
+const TF_CHART_FRAMES = ['10s', '15s', '30s', '5m', '10m', '15m'];
+const TF_CHART_MS = { '5m': 300000, '10m': 600000, '15m': 900000 };
+/* Candle sources, reusing existing data only: sub-minute frames reuse the
+   tfSubBuckets arrays directly (buckets already carry {t,o,h,l,c,v} — full
+   OHLC candles, no conversion or bucket-shape change needed); 5m/10m/15m
+   reuse tfAggregateCandles on the 1-minute candles, the same aggregation
+   the timeframe states use. */
+function tfChartSources(ccs, subBuckets) {
+  const src = [];
+  for (const name of ['10s', '15s', '30s']) src.push({ name, candles: (subBuckets && subBuckets[name]) || [] });
+  for (const name of ['5m', '10m', '15m']) src.push({ name, candles: tfAggregateCandles(ccs || [], TF_CHART_MS[name]) });
+  return src;
+}
+/* State text mirrors tfConfirmCard's row logic exactly (warming up / locked
+   in / neutral); kept as a tiny duplicate so tfConfirmCard stays untouched. */
+function tfChartStateText(f) {
+  if (!f) return '--';
+  if (f.warmingUp) return 'warming up';
+  if (f.locked) return f.dir + ' · locked in';
+  return '—';
+}
+function tfChartsHtml(sources, tfc, line, price) {
+  const summary = tfc ? tfc.summary : null;
+  const blocks = (sources || []).map(src => {
+    const f = (tfc && tfc.frames) ? tfc.frames[src.name] : null;
+    const cs = (src.candles || []).slice(-60);
+    const n = f ? f.n : cs.length;
+    const col = f && f.locked ? (f.dir === 'UP' ? '#34d399' : '#fb7185') : '#eef1f6';
+    return '<div style="margin-top:12px"><div style="font-weight:700">' + esc(src.name) + ' <span style="color:' + col + '">' + esc(tfChartStateText(f)) + '</span> <span class="muted" style="font-weight:400">· ' + n + ' candles</span></div>' +
+      chartSvg(cs, { height: 140, id: 'llchart-' + src.name, showZones: false, label: 'BTC ' + src.name + ' chart', line, price }) + '</div>';
+  }).join('');
+  /* Collapsible, matching the existing <details>/<summary> Diagnostics
+     pattern: tap the header to open/close. The summary carries the
+     timeframe summary line so the state stays visible while closed.
+     Default open; llTfChartsRestore() persists the state. */
+  return '<details class="card" id="lltfcharts" open><summary style="font-size:19px;font-weight:700;color:#cbd2e1">Timeframe charts' + (summary ? ' <span class="muted" style="font-weight:400">· ' + esc(summary) + '</span>' : '') + '</summary>' + blocks + '</details>';
+}
+function tfChartsCard(s) {
+  return tfChartsHtml(tfChartSources(closedCandles(Date.now()), tfSubBuckets), s.tfConfirm, s.line, s.price);
 }
 /* Row values for the Market context and Flow & levels cards. Display only:
    the same numbers as the shadow readouts, without sentence prefixes, so
@@ -1453,8 +1583,18 @@ function tfConfirmCard(s) {
   }
   return '<div class="card"><h3 style="margin:0 0 8px">Timeframe confirmation</h3>' + inner + '</div>';
 }
+/* Display-only: the call values the hero and the Checks list show. Once a call
+   locks, the locking tick's snapshot freezes the direction, %, verdict, edge,
+   grade, and checks for the rest of the round; everything else on the page
+   (price, line, asks, RSI, flow, levels) keeps reading live STATUS. Pure:
+   takes a STATUS-shaped object. */
+function callDisplay(s) {
+  const snap = s && s.callSnap;
+  if (!snap) return { side: s.side, prob: s.prob, verdict: s.verdict, edgeCents: s.edgeCents, grade: s.grade, checks: s.checks, frozenAt: null };
+  return { side: snap.side, prob: snap.prob, verdict: snap.decision, edgeCents: snap.edgeCents, grade: snap.grade, checks: snap.checks, frozenAt: snap.at };
+}
 function page() {
-  const s = STATUS, rows = (s.checks || []).map(c => '<li>' + esc(c) + '</li>').join('');
+  const s = STATUS, cd = callDisplay(s), rows = (cd.checks || []).map(c => '<li>' + esc(c) + '</li>').join('');
   const st = stats();
   const fh = s.feedHealth || {};
   const feeds = Object.keys(fh).map(k => '<span style="color:' + (fh[k] === 'ok' ? '#34d399' : '#fb7185') + '">' + esc(FEEDS[k].name) + ': ' + esc(fh[k]) + '</span>').join(' · ');
@@ -1468,7 +1608,7 @@ function page() {
   }).join('') || '<tr><td colspan="9">none yet</td></tr>';
   const calRows = st.cal.map(b => '<tr><td>' + b.range + '</td><td>' + b.n + '</td><td>' + pct(b.avgP) + '</td><td>' + pct(b.actual) + '</td><td>' + (b.n >= 20 && b.actual != null ? (b.actual < b.avgP - 0.05 ? '<span style="color:#fb7185">overconfident</span>' : b.actual > b.avgP + 0.05 ? 'underconfident' : '<span style="color:#34d399">ok</span>') : 'need 20+') + '</td></tr>').join('');
   const P = paper();
-  const leanPct = s.prob == null ? 0 : Math.min(100, Math.max(0, s.prob));
+  const leanPct = cd.prob == null ? 0 : Math.min(100, Math.max(0, cd.prob));
   const kAsk = s.kalshi && s.kalshi.yesAsk != null ? Math.round(s.kalshi.yesAsk * 100) + 'c' : '--';
   const pAsk = s.polyUs && s.polyUs.ask != null ? Math.round(s.polyUs.ask * 100) + 'c' : '--';
   /* stat tiles + calendar: all from paper()/dailyPnl(), real numbers only */
@@ -1524,13 +1664,13 @@ function page() {
     '<body style="font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b0d12;color:#eef1f6;padding:16px"><h2>Line Lock</h2><p class="muted" style="margin-top:-8px">BTC 15-minute watcher · Live</p>' +
     '<div class="card hero"><span class="pill">&#9679; ' + heroTitle + '</span> <span class="pill pill-tape">' + heroReason + '</span>' +
     '<div class="big" style="margin-top:12px">' + (s.price == null ? '--' : usd(s.price)) + '</div>' +
-    '<div class="muted">Line ' + (s.line == null ? '--' : usd(s.line)) + ' (' + (s.lineFrom || '--') + ') · ' + (s.left || '--') + ' left · lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '% · ' + (s.verdict || '--') + '</div>' +
-    '<div style="margin-top:14px"><b>Lean ' + (s.side || '--') + ' ' + (s.prob || '--') + '%' + (s.grade ? ' · Grade ' + esc(s.grade.grade) + ' · ' + s.grade.passN + '/' + s.grade.total : '') + '</b> <span class="muted">· model up ' + (s.rawProbUp == null ? '--' : s.rawProbUp + '%') + ' · Kalshi up ' + (s.marketProbUp == null ? '--' : s.marketProbUp + '%') + ' · edge ' + (s.edgeCents == null ? '--' : (s.edgeCents >= 0 ? '+' : '') + s.edgeCents + 'c') + (s.stake ? ' · quarter-Kelly ' + usd(s.stake, 0) : '') + '</span></div>' +
+    '<div class="muted">Line ' + (s.line == null ? '--' : usd(s.line)) + ' (' + (s.lineFrom || '--') + ') · ' + (s.left || '--') + ' left · ' + (cd.side || '--') + ' ' + (cd.prob || '--') + '% · ' + (cd.verdict || '--') + (cd.frozenAt != null ? ' · call locked ' + etTime(cd.frozenAt) : '') + '</div>' +
+    '<div style="margin-top:14px"><b>' + (cd.side || '--') + ' ' + (cd.prob || '--') + '%' + (cd.grade ? ' · Grade ' + esc(cd.grade.grade) + ' · ' + cd.grade.passN + '/' + cd.grade.total : '') + '</b> <span class="muted">· model up ' + (s.rawProbUp == null ? '--' : s.rawProbUp + '%') + ' · Kalshi up ' + (s.marketProbUp == null ? '--' : s.marketProbUp + '%') + ' · edge ' + (cd.edgeCents == null ? '--' : (cd.edgeCents >= 0 ? '+' : '') + cd.edgeCents + 'c') + (s.stake ? ' · quarter-Kelly ' + usd(s.stake, 0) : '') + '</span></div>' +
     '<div class="bar"><div style="width:' + leanPct + '%"></div></div>' +
     '<div class="muted">Up ask &middot; Kalshi ' + kAsk + ' &middot; Polymarket US ' + pAsk + '</div>' +
     '<div class="muted">' + (s.feeds || 0) + ' feeds live · RSI 1m ' + (s.rsi1 == null ? '--' : s.rsi1) + ' · whale net 5m ' + (s.whaleNet5m == null ? '--' : usdK(s.whaleNet5m)) + (s.surge ? ' · SURGE' : '') + '</div>' +
     '<div style="margin-top:8px">' + feeds + '</div></div>' +
-    chartHtml + tilesHtml + ctxCard + flowCard + tfConfirmCard(s) + calHtml +
+    chartHtml + tilesHtml + ctxCard + flowCard + tfConfirmCard(s) + tfChartsCard(s) + calHtml +
     '<div class="card"><h3 style="margin:0 0 8px">Checks</h3><ul style="margin:8px 0;padding-left:20px">' + rows + '</ul></div>' +
     '<h3>Recent rounds</h3><table><tr><th>round (ET)</th><th>call</th><th>type</th><th>model</th><th>ask</th><th>edge</th><th>line &rarr; final</th><th>result</th><th></th></tr>' + recRows + '</table>' +
     paperCard() +
@@ -1538,6 +1678,7 @@ function page() {
     '<table><tr><th>model said</th><th>rounds</th><th>avg said</th><th>actually won</th><th></th></tr>' + calRows + '</table>' +
     '<p class="muted">Alerts: ' + (s.topicSet ? 'topic set' : '<b>NTFY_TOPIC is not set</b>') + ' · ' + ROUNDS.length + ' rounds logged · ' + st.edited + ' edited</p>' +
     '<details><summary>Diagnostics</summary><p class="muted">' + esc(JSON.stringify(s.diag || {})) + '</p></details>' +
+    '<details id="rdet"><summary>Restore backup</summary><p class="muted">Pick the backup file Muse sent you. Restoring fills the rounds, stats, and paper balance on this page from the backup.</p><input id="rfile" type="file" accept=".json"><br><br>Key (same as the Edit buttons): <input id="rkey" type="password" placeholder="EDIT_KEY"><br><br><label><input id="rforce" type="checkbox"> Replace rounds already on the page</label><br><br><button onclick="doRestore()">Restore</button> <span id="rmsg"></span></details>' +
     '<div id="edbox"><b>Edit round</b><br>Call: <select id="eside"><option>UP</option><option>DOWN</option></select><br>Result: <select id="eres"><option value="auto">auto (from price)</option><option value="won">won</option><option value="lost">lost</option><option value="skip">skip (did not trade / ignore)</option></select><br>Key: <input id="ekey" type="password" placeholder="EDIT_KEY"><br><button onclick="save()">Save</button> <button onclick="clr()">Undo edit</button> <button onclick="cls()">Cancel</button> <span id="emsg"></span></div>' +
     '<script>var cur=null,editing=false;function ed(id,side,res){cur=id;editing=true;document.getElementById("eside").value=side;document.getElementById("eres").value=(res==="won"||res==="lost"||res==="skip")?res:"auto";document.getElementById("ekey").value=localStorage.llkey||"";document.getElementById("edbox").style.display="block"}' +
     'function cls(){editing=false;document.getElementById("edbox").style.display="none"}' +
@@ -1550,7 +1691,20 @@ function page() {
     zoomViewBox.toString() + ';var LLZ=[1,1.5,2,3,4];function llZoomApply(){try{var svg=document.getElementById("llchart");if(!svg)return;var L=parseFloat(localStorage.getItem("llChartZoom"))||1;if(LLZ.indexOf(L)<0)L=1;svg.setAttribute("viewBox",zoomViewBox(L));var lb=document.getElementById("llzoomlbl");if(lb)lb.textContent=L+"x";}catch(e){}}' +
     'function llZoomStep(d){try{var cur=parseFloat(localStorage.getItem("llChartZoom"))||1;var i=LLZ.indexOf(cur);if(i<0)i=0;i=Math.max(0,Math.min(LLZ.length-1,i+d));localStorage.setItem("llChartZoom",String(LLZ[i]));}catch(e){}llZoomApply();}' +
     'function llZoomReset(){try{localStorage.setItem("llChartZoom","1");}catch(e){}llZoomApply();}llZoomApply();' +
-    'setInterval(function(){if(!editing)location.reload()},5000)</script></body>';
+    /* Timeframe-charts collapse state: same embedding pattern as the zoom
+       math — the shipped client code is the tested function. */
+    llTfChartsRestore.toString() + ';llTfChartsRestore();' +
+    /* Restore backup: no <form>; explicit handlers only. Accepts the
+       /api/rounds payload shape ({rounds:[...]}) or a raw array. The 5s
+       reload pauses while this section is open so the picked file and the
+       typed key survive until Restore is tapped. */
+    'function doRestore(){var msg=document.getElementById("rmsg");msg.textContent="";var f=document.getElementById("rfile").files[0];if(!f){msg.textContent="pick a backup file first";return;}editing=true;var k=document.getElementById("rkey").value;try{localStorage.llkey=k;}catch(e){}var rd=new FileReader();' +
+    'rd.onerror=function(){editing=false;msg.textContent="could not read that file";};' +
+    'rd.onload=function(){var parsed;try{parsed=JSON.parse(rd.result);}catch(e){editing=false;msg.textContent="that file is not valid JSON";return;}var rounds=Array.isArray(parsed)?parsed:(parsed&&parsed.rounds);if(!Array.isArray(rounds)){editing=false;msg.textContent="couldn\'t find rounds in that file";return;}' +
+    'fetch("/api/restore",{method:"POST",headers:{"Content-Type":"application/json","X-Edit-Key":k},body:JSON.stringify({rounds:rounds,force:document.getElementById("rforce").checked})}).then(function(r){return r.text().then(function(t){if(r.ok){var j=null;try{j=JSON.parse(t);}catch(e){}if(j&&j.paper){msg.textContent="Restored "+j.restored+" rounds — paper $"+Number(j.paper.balance).toFixed(2)+" ("+j.paper.wins+"-"+j.paper.losses+")";}else{msg.textContent="Restored "+(j?j.restored:"?")+" rounds";}setTimeout(function(){location.reload();},900);}else{editing=false;msg.textContent=t;}});}).catch(function(){editing=false;msg.textContent="restore failed: could not reach the page";});};' +
+    'rd.readAsText(f);}' +
+    'try{document.getElementById("rkey").value=localStorage.llkey||"";}catch(e){}' +
+    'setInterval(function(){if(!editing&&!document.getElementById("rdet").open)location.reload()},5000)</script></body>';
 }
 function paperCard() {
   const P = paper(), sg = v => (v >= 0 ? '+' : '-') + usd(Math.abs(v)), tr = t => t ? sg(t.pnl) + ' (' + etDate(t.end) + ' ' + etTime(t.end) + ' ET, ' + t.contracts + 'x ' + esc(t.side) + ' @ ' + cents(t.ask) + ')' : '--';
@@ -1560,7 +1714,33 @@ function paperCard() {
     'Max drawdown ' + usd(P.maxDrawdown) + ' (' + (P.maxDrawdownPct * 100).toFixed(1) + '%) · best ' + tr(P.best) + ' · worst ' + tr(P.worst) + '<br>' +
     '<span style="color:#7a899f">Simulated buys at the ask when the call is made, on every TAKE; edits recompute it. <a style="color:#7a899f" href="/api/paper">json</a> · <a style="color:#7a899f" href="/api/export.csv">csv</a></span></div>';
 }
-function readBody(req) { return new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > 10000) { no(new Error('too big')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); }); }
+/* Restore payload validation: pure, testable. `raw` is the request body
+   string. All-or-nothing: any failure rejects the whole payload, never a
+   partial restore. Returns {ok:true, rounds, force} with rounds sorted by
+   end ascending, or {ok:false, error} (status 409 only for the
+   non-empty-history guard; every payload problem is a 400). */
+function validateRestorePayload(raw, roundsLen, currentRoundEnd) {
+  let b;
+  if (typeof raw !== 'string') return { ok: false, error: 'bad JSON' };
+  try { b = JSON.parse(raw); } catch (e) { return { ok: false, error: 'bad JSON' }; }
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return { ok: false, error: 'body must be an object with a rounds array' };
+  if (!Array.isArray(b.rounds)) return { ok: false, error: 'rounds must be an array' };
+  if (b.rounds.length < 1 || b.rounds.length > 2000) return { ok: false, error: 'rounds must contain 1 to 2000 entries' };
+  const seen = new Set();
+  for (let i = 0; i < b.rounds.length; i++) {
+    const r = b.rounds[i];
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return { ok: false, error: 'round at index ' + i + ' must be an object' };
+    if (typeof r.id !== 'number' || !isFinite(r.id)) return { ok: false, error: 'round at index ' + i + ' must have a numeric id' };
+    if (typeof r.end !== 'number' || !isFinite(r.end) || r.end <= 0) return { ok: false, error: 'round at index ' + i + ' must have a numeric end greater than 0' };
+    if (seen.has(r.id)) return { ok: false, error: 'duplicate round id ' + r.id };
+    seen.add(r.id);
+    if (r.end >= currentRoundEnd) return { ok: false, error: 'round at index ' + i + ' ends at or after the live round end' };
+  }
+  const force = b.force === true;
+  if (roundsLen > 0 && !force) return { ok: false, status: 409, error: 'rounds already exist; restore only into an empty history, or send force:true' };
+  return { ok: true, rounds: b.rounds.slice().sort((x, y) => x.end - y.end), force };
+}
+function readBody(req, maxBytes) { const cap = maxBytes || 10000; return new Promise((ok, no) => { let b = ''; req.on('data', c => { b += c; if (b.length > cap) { no(new Error('too big')); req.destroy(); } }); req.on('end', () => ok(b)); req.on('error', no); }); }
 function startServer() {
   const srv = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://x');
@@ -1592,6 +1772,15 @@ function startServer() {
         r.edit = e;
       }
       saveRounds(); savePaper(); res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, round: r, stats: stats(), paper: paper() }));
+    }
+    if (u.pathname === '/api/restore' && req.method === 'POST') {
+      if (!CFG.editKey || req.headers['x-edit-key'] !== CFG.editKey) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('wrong or missing key (EDIT_KEY, or your NTFY_TOPIC if EDIT_KEY is not set)'); }
+      let raw; try { raw = await readBody(req, 1000000); } catch (e) { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('request body too big (1MB limit)'); }
+      const v = validateRestorePayload(raw, ROUNDS.length, (R && R.end) || 0);
+      if (!v.ok) { res.writeHead(v.status || 400, { 'Content-Type': 'text/plain' }); return res.end(v.error); }
+      ROUNDS = v.rounds;
+      saveRounds(); savePaper();
+      res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, restored: v.rounds.length, stats: stats(), paper: paper() }));
     }
     if (u.pathname === '/test') {
       if (!CFG.topic || u.searchParams.get('key') !== CFG.topic) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('Add ?key=YOUR_TOPIC_NAME to the address'); }
